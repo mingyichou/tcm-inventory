@@ -54,6 +54,22 @@ def build_bopomofo_index(product_names: tuple) -> dict:
     return index
 
 
+def get_bopomofo_sort_key(name: str) -> str:
+    """取得品項名稱的注音排序鍵（用於同分類內排序）"""
+    result = []
+    for char_bpmf in pinyin(name, style=Style.BOPOMOFO):
+        result.append(char_bpmf[0])
+    return "".join(result)
+
+
+def sort_products_by_bopomofo(products: list) -> list:
+    """依分類排序，同分類內依注音首碼排序"""
+    return sorted(products, key=lambda p: (
+        p.get("category_id", 0),
+        get_bopomofo_sort_key(p["name"])
+    ))
+
+
 def match_search(name: str, key_index: tuple, search_text: str) -> bool:
     search_lower = search_text.lower().strip()
     if not search_lower:
@@ -75,10 +91,11 @@ def match_search(name: str, key_index: tuple, search_text: str) -> bool:
 @st.cache_data(ttl=30)
 def load_products():
     sb = get_supabase_client()
-    return sb.table("products").select(
+    data = sb.table("products").select(
         "id, name, category_id, unit_id, brand1_id, brand2_id, spec_note, is_active, "
         "categories(name), units(name)"
-    ).order("category_id").order("name").execute().data
+    ).execute().data
+    return sort_products_by_bopomofo(data)
 
 @st.cache_data(ttl=30)
 def load_brands():
@@ -131,10 +148,11 @@ def page_stock_overview():
     with col2:
         search = st.text_input("搜尋", placeholder="中文 或 注音首碼（ee=葛根, 2e=當歸）", key="stock_search")
 
-    # 載入品項
+    # 載入品項（依分類＋注音排序）
     products = sb.table("products").select(
         "id, name, category_id, brand1_id, brand2_id, categories(name), units(name)"
-    ).eq("is_active", True).order("category_id").order("name").execute().data
+    ).eq("is_active", True).execute().data
+    products = sort_products_by_bopomofo(products)
 
     # 建搜尋索引
     all_names = tuple(p["name"] for p in products)
@@ -352,8 +370,9 @@ def page_transactions():
     with tab_add:
         sb = get_supabase_client()
         products = sb.table("products").select(
-            "id, name, categories(name), units(name)"
-        ).eq("is_active", True).order("name").execute().data
+            "id, name, category_id, categories(name), units(name)"
+        ).eq("is_active", True).execute().data
+        products = sort_products_by_bopomofo(products)
 
         stock_resp = sb.table("clinic_stock").select("product_id, current_stock").eq("clinic_id", clinic_id).execute()
         stock_map = {s["product_id"]: s["current_stock"] for s in stock_resp.data}
@@ -493,8 +512,9 @@ def page_inventory():
         print_cat = st.selectbox("分類", ["全部"] + [c["name"] for c in load_categories()], key="print_cat")
 
         products = sb.table("products").select(
-            "name, categories(name), units(name)"
-        ).eq("is_active", True).order("category_id").order("name").execute().data
+            "name, category_id, categories(name), units(name)"
+        ).eq("is_active", True).execute().data
+        products = sort_products_by_bopomofo(products)
 
         if print_cat != "全部":
             products = [p for p in products if p["categories"]["name"] == print_cat]
@@ -533,7 +553,8 @@ def page_inventory():
 
         products = sb.table("products").select(
             "id, name, category_id, categories(name), units(name)"
-        ).eq("is_active", True).order("category_id").order("name").execute().data
+        ).eq("is_active", True).execute().data
+        products = sort_products_by_bopomofo(products)
 
         stock_resp = sb.table("clinic_stock").select("product_id, current_stock").eq("clinic_id", clinic_id).execute()
         stock_map = {s["product_id"]: s["current_stock"] for s in stock_resp.data}
@@ -705,9 +726,9 @@ def page_items():
 
         if rows:
             df = pd.DataFrame(rows)
-            is_admin = st.session_state.user["role"] == "admin"
+            can_edit = st.session_state.user["role"] in ("admin", "manager")
 
-            if is_admin:
+            if can_edit:
                 edited_df = st.data_editor(
                     df, use_container_width=True, hide_index=True,
                     height=min(len(df) * 35 + 38, 600),
@@ -753,7 +774,7 @@ def page_items():
                 st.caption(f"共 {len(df)} 個品項")
 
     with tab_add:
-        if st.session_state.user["role"] != "admin":
+        if st.session_state.user["role"] not in ("admin", "manager"):
             st.warning("僅管理者可新增品項")
             return
 
@@ -922,7 +943,8 @@ def page_order():
 
     products = sb.table("products").select(
         "id, name, category_id, brand1_id, brand2_id, categories(name), units(name)"
-    ).eq("is_active", True).order("category_id").order("name").execute().data
+    ).eq("is_active", True).execute().data
+    products = sort_products_by_bopomofo(products)
 
     brands = load_brands()
     brand_map = {b["id"]: b["name"] for b in brands}
@@ -1023,16 +1045,23 @@ def page_order():
 # ══════════════════════════════════════════════
 
 def page_settings():
-    if st.session_state.user["role"] != "admin":
+    role = st.session_state.user["role"]
+    if role not in ("admin", "manager"):
         st.warning("僅管理者可使用此功能")
         return
 
     st.header("⚙️ 系統設定")
     sb = get_supabase_client()
 
-    tab_params, tab_cats, tab_brands, tab_units, tab_users = st.tabs([
-        "📊 參數", "📂 分類", "🏭 廠牌", "📏 單位", "👤 帳號"
-    ])
+    if role == "admin":
+        tab_params, tab_cats, tab_brands, tab_units, tab_users = st.tabs([
+            "📊 參數", "📂 分類", "🏭 廠牌", "📏 單位", "👤 帳號"
+        ])
+    else:
+        tab_params, tab_cats, tab_brands, tab_units = st.tabs([
+            "📊 參數", "📂 分類", "🏭 廠牌", "📏 單位"
+        ])
+        tab_users = None
 
     # ── 參數 ──
     with tab_params:
@@ -1139,7 +1168,9 @@ def page_settings():
                     sb.table("units").insert({"name": nu}).execute()
                     st.success(f"已新增：{nu}"); load_units.clear()
 
-    # ── 帳號（可編輯、可刪除、可新增）──
+    # ── 帳號（可編輯、可刪除、可新增）── 僅 admin
+    if tab_users is None:
+        return
     with tab_users:
         users = sb.table("users").select("id, username, role, display_name, clinic_id, clinics(name)").execute().data
         clinics_data = sb.table("clinics").select("id, name").execute().data

@@ -70,7 +70,7 @@ def main():
             "🛒 叫貨出表",
         ]
 
-        if role == "admin":
+        if role in ("admin", "manager"):
             menu_items.append("⚙️ 系統設定")
 
         menu_items.append("🚪 登出")
