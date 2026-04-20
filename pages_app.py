@@ -99,7 +99,10 @@ def style_banded(df, highlight_col=None):
             hl = "background-color: #E8E0F0; font-weight: bold; border-left: 3px solid #6A5ACD"
             styles[col_idx] = hl + ("; " + border if border else "")
         return styles
-    return df.style.apply(row_style, axis=1)
+    # 數字欄位格式化為整數，None 顯示空白
+    num_cols = df.select_dtypes(include=["number", "float", "int"]).columns.tolist()
+    fmt = {c: lambda v: "" if pd.isna(v) else f"{int(v)}" for c in num_cols}
+    return df.style.apply(row_style, axis=1).format(fmt)
 
 
 # ══════════════════════════════════════════════
@@ -827,150 +830,211 @@ def page_inventory():
         if not sessions:
             st.info("尚無盤點紀錄")
         else:
+            # 載入全品項（用於顯示完整清單）
+            all_products = sb.table("products").select(
+                "id, name, category_id, units(name)"
+            ).execute().data
+            all_products = sort_products_by_bopomofo(all_products)
+
+            # per-clinic 啟用
+            cs_active = sb.table("clinic_stock").select(
+                "product_id, current_stock, is_active"
+            ).eq("clinic_id", clinic_id).execute().data
+            active_pids = {s["product_id"] for s in cs_active if s.get("is_active", True)}
+            stock_map_hist = {s["product_id"]: int(s["current_stock"]) for s in cs_active}
+            all_products = [p for p in all_products if p["id"] in active_pids]
+
             for s in sessions:
                 operator = s["users"]["display_name"] if s.get("users") else "-"
                 with st.expander(f"📋 {s['session_date']}（{operator}）", expanded=False):
+                    # 載入此 session 已有的 logs
                     logs = sb.table("inventory_logs").select(
-                        "id, product_id, products(name, category_id, units(name)), "
-                        "last_count_qty, restock_qty_since_last, current_count_qty, consumed_qty"
+                        "id, product_id, last_count_qty, restock_qty_since_last, "
+                        "current_count_qty, consumed_qty"
                     ).eq("session_id", s["id"]).execute().data
-                    # 依分類+注音排序
-                    logs = sorted(logs, key=lambda l: (
-                        l["products"].get("category_id", 0),
-                        get_bopomofo_sort_key(l["products"]["name"])
-                    ))
+                    log_by_pid = {l["product_id"]: l for l in logs}
 
-                    if not logs:
-                        st.info("此盤點批次沒有明細紀錄（可能是空批次）")
+                    counted = len(logs)
+                    total = len(all_products)
+                    st.caption(f"已盤 {counted} / {total} 個品項")
 
-                        # admin 可刪除空批次
-                        if user["role"] == "admin":
-                            if st.button(f"🗑️ 刪除此空批次", key=f"del_empty_{s['id']}"):
-                                sb.table("inventory_sessions").delete().eq("id", s["id"]).execute()
-                                st.success("已刪除")
-                                st.rerun()
-                    else:
-                        # 顯示可編輯的表格
-                        log_rows = []
-                        log_ids = []
-                        log_pids = []
-                        for l in logs:
+                    # 組裝全品項表格（已盤的顯示數量，未盤的留空）
+                    log_rows = []
+                    row_meta = []  # (product_id, log_id_or_None)
+                    for p in all_products:
+                        pid = p["id"]
+                        log = log_by_pid.get(pid)
+                        if log:
                             log_rows.append({
-                                "品項": l["products"]["name"],
-                                "單位": l["products"]["units"]["name"],
-                                "上次盤點": int(l["last_count_qty"]) if l["last_count_qty"] is not None else 0,
-                                "期間進貨": int(l["restock_qty_since_last"]) if l["restock_qty_since_last"] is not None else 0,
-                                "盤點數量": int(l["current_count_qty"]) if l["current_count_qty"] is not None else 0,
-                                "耗用量": int(l["consumed_qty"]) if l["consumed_qty"] is not None else 0,
+                                "品項": p["name"],
+                                "分類": "",
+                                "單位": p["units"]["name"],
+                                "帳面庫存": stock_map_hist.get(pid, 0),
+                                "盤點數量": int(log["current_count_qty"]) if log["current_count_qty"] is not None else None,
                             })
-                            log_ids.append(l["id"])
-                            log_pids.append(l["product_id"])
+                            row_meta.append((pid, log["id"]))
+                        else:
+                            log_rows.append({
+                                "品項": p["name"],
+                                "分類": "",
+                                "單位": p["units"]["name"],
+                                "帳面庫存": stock_map_hist.get(pid, 0),
+                                "盤點數量": None,
+                            })
+                            row_meta.append((pid, None))
 
-                        log_df = pd.DataFrame(log_rows)
+                    log_df = pd.DataFrame(log_rows)
 
-                        edited_log_df = st.data_editor(
-                            log_df,
-                            use_container_width=True, hide_index=True,
-                            column_config={
-                                "品項": st.column_config.TextColumn(disabled=True),
-                                "單位": st.column_config.TextColumn(disabled=True),
-                                "上次盤點": st.column_config.NumberColumn(disabled=True, format="%d"),
-                                "期間進貨": st.column_config.NumberColumn(disabled=True, format="%d"),
-                                "盤點數量": st.column_config.NumberColumn("盤點數量 ✏️", min_value=0, format="%d"),
-                                "耗用量": st.column_config.NumberColumn(disabled=True, format="%d"),
-                            },
-                            key=f"hist_editor_{s['id']}",
-                        )
+                    edited_log_df = st.data_editor(
+                        log_df,
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "品項": st.column_config.TextColumn(disabled=True),
+                            "分類": st.column_config.TextColumn(disabled=True),
+                            "單位": st.column_config.TextColumn(disabled=True),
+                            "帳面庫存": st.column_config.NumberColumn(disabled=True, format="%d"),
+                            "盤點數量": st.column_config.NumberColumn("盤點數量 ✏️", min_value=0, format="%d"),
+                        },
+                        height=min(len(log_df) * 35 + 38, 600),
+                        key=f"hist_editor_{s['id']}",
+                    )
 
-                        col_save, col_del = st.columns([3, 1])
-                        with col_save:
-                            if st.button("💾 儲存修改", key=f"hist_save_{s['id']}", type="primary"):
-                                updated = 0
-                                for idx in range(len(edited_log_df)):
-                                    old_qty = log_df.iloc[idx]["盤點數量"]
-                                    new_qty = int(edited_log_df.iloc[idx]["盤點數量"])
-                                    if old_qty != new_qty:
-                                        last_qty = log_df.iloc[idx]["上次盤點"]
-                                        restock = log_df.iloc[idx]["期間進貨"]
-                                        new_consumed = last_qty + restock - new_qty
+                    col_save, col_del = st.columns([3, 1])
+                    with col_save:
+                        if st.button("💾 儲存修改", key=f"hist_save_{s['id']}", type="primary"):
+                            # 載入進貨資料
+                            all_tx = sb.table("transactions").select(
+                                "product_id, change_qty, tx_date"
+                            ).eq("clinic_id", clinic_id).execute().data
+                            tx_by_pid = defaultdict(list)
+                            for tx in all_tx:
+                                tx_by_pid[tx["product_id"]].append(tx)
 
-                                        sb.table("inventory_logs").update({
-                                            "current_count_qty": new_qty,
-                                            "consumed_qty": new_consumed,
-                                        }).eq("id", log_ids[idx]).execute()
+                            # 載入每品項最新盤點（排除當前 session）
+                            prev_logs = sb.table("inventory_logs").select(
+                                "product_id, current_count_qty, log_date"
+                            ).eq("clinic_id", clinic_id).neq(
+                                "session_id", s["id"]
+                            ).order("log_date", desc=True).execute().data
+                            prev_map = {}
+                            prev_date_map = {}
+                            for pl in prev_logs:
+                                pid = pl["product_id"]
+                                if pid not in prev_map:
+                                    prev_map[pid] = int(pl["current_count_qty"])
+                                    prev_date_map[pid] = pl["log_date"]
 
-                                        # 如果是最新一次盤點，更新庫存
-                                        latest_log = sb.table("inventory_logs").select(
+                            updated, inserted = 0, 0
+                            for idx in range(len(edited_log_df)):
+                                new_val = edited_log_df.iloc[idx]["盤點數量"]
+                                old_val = log_df.iloc[idx]["盤點數量"]
+                                pid, log_id = row_meta[idx]
+
+                                if pd.isna(new_val):
+                                    continue
+
+                                new_qty = int(new_val)
+
+                                # 計算耗用
+                                last_qty = prev_map.get(pid, stock_map_hist.get(pid, 0))
+                                last_dt = prev_date_map.get(pid, "1900-01-01")
+                                restock_sum = int(sum(
+                                    int(t["change_qty"]) for t in tx_by_pid.get(pid, [])
+                                    if last_dt < t["tx_date"] <= s["session_date"]
+                                ))
+                                consumed = int(last_qty + restock_sum - new_qty)
+
+                                if log_id is not None:
+                                    # 已有 log — 更新
+                                    if pd.notna(old_val) and int(old_val) == new_qty:
+                                        continue
+                                    sb.table("inventory_logs").update({
+                                        "current_count_qty": new_qty,
+                                        "consumed_qty": consumed,
+                                    }).eq("id", log_id).execute()
+                                    updated += 1
+                                else:
+                                    # 新增 log
+                                    sb.table("inventory_logs").insert({
+                                        "session_id": int(s["id"]),
+                                        "product_id": int(pid),
+                                        "clinic_id": int(clinic_id),
+                                        "last_count_qty": int(last_qty),
+                                        "restock_qty_since_last": restock_sum,
+                                        "current_count_qty": new_qty,
+                                        "consumed_qty": consumed,
+                                        "log_date": s["session_date"],
+                                    }).execute()
+                                    inserted += 1
+
+                                # 更新即時庫存（如果是最新盤點）
+                                latest_check = sb.table("inventory_logs").select(
+                                    "log_date"
+                                ).eq("product_id", pid).eq(
+                                    "clinic_id", clinic_id
+                                ).order("log_date", desc=True).limit(1).execute().data
+                                if latest_check and latest_check[0]["log_date"] <= s["session_date"]:
+                                    restock_after = int(sum(
+                                        int(t["change_qty"]) for t in tx_by_pid.get(pid, [])
+                                        if t["tx_date"] > s["session_date"]
+                                    ))
+                                    sb.table("clinic_stock").update(
+                                        {"current_stock": int(new_qty + restock_after)}
+                                    ).eq("product_id", pid).eq("clinic_id", clinic_id).execute()
+
+                            msg = []
+                            if updated > 0:
+                                msg.append(f"修改 {updated} 筆")
+                            if inserted > 0:
+                                msg.append(f"新增 {inserted} 筆")
+                            if msg:
+                                st.success("已" + "、".join(msg))
+                                st.rerun()
+                            else:
+                                st.info("沒有變更")
+
+                    with col_del:
+                        if user["role"] == "admin":
+                            if st.button("🗑️ 刪除整筆", key=f"hist_del_{s['id']}", type="secondary"):
+                                try:
+                                    for l in logs:
+                                        pid = l["product_id"]
+                                        latest = sb.table("inventory_logs").select(
                                             "id, log_date"
-                                        ).eq("product_id", log_pids[idx]).eq(
+                                        ).eq("product_id", pid).eq(
                                             "clinic_id", clinic_id
                                         ).order("log_date", desc=True).limit(1).execute().data
 
-                                        if latest_log and latest_log[0]["id"] == log_ids[idx]:
-                                            all_tx = sb.table("transactions").select(
-                                                "change_qty, tx_date"
-                                            ).eq("product_id", log_pids[idx]).eq(
-                                                "clinic_id", clinic_id
-                                            ).gt("tx_date", s["session_date"]).execute().data
-                                            restock_after = sum(int(t["change_qty"]) for t in all_tx)
-                                            sb.table("clinic_stock").update(
-                                                {"current_stock": new_qty + restock_after}
-                                            ).eq("product_id", log_pids[idx]).eq("clinic_id", clinic_id).execute()
-
-                                        updated += 1
-
-                                if updated > 0:
-                                    st.success(f"已更新 {updated} 筆")
-                                    st.rerun()
-                                else:
-                                    st.info("沒有變更")
-
-                        with col_del:
-                            if user["role"] == "admin":
-                                if st.button("🗑️ 刪除整筆", key=f"hist_del_{s['id']}", type="secondary"):
-                                    try:
-                                        # 刪除前，還原庫存
-                                        for idx, l in enumerate(logs):
-                                            pid = l["product_id"]
-                                            # 檢查這筆是否為該品項最新的 log
-                                            latest = sb.table("inventory_logs").select(
-                                                "id, log_date"
+                                        if latest and latest[0]["id"] == l["id"]:
+                                            prev = sb.table("inventory_logs").select(
+                                                "current_count_qty, log_date"
                                             ).eq("product_id", pid).eq(
                                                 "clinic_id", clinic_id
-                                            ).order("log_date", desc=True).limit(1).execute().data
+                                            ).order("log_date", desc=True).limit(2).execute().data
 
-                                            if latest and latest[0]["id"] == l["id"]:
-                                                # 是最新的 log — 刪除後需要退回到上一次盤點
-                                                prev = sb.table("inventory_logs").select(
-                                                    "current_count_qty, log_date"
-                                                ).eq("product_id", pid).eq(
-                                                    "clinic_id", clinic_id
-                                                ).order("log_date", desc=True).limit(2).execute().data
+                                            if len(prev) >= 2:
+                                                prev_qty = int(prev[1]["current_count_qty"])
+                                                prev_date = prev[1]["log_date"]
+                                            else:
+                                                prev_qty = 0
+                                                prev_date = "1900-01-01"
 
-                                                if len(prev) >= 2:
-                                                    prev_qty = int(prev[1]["current_count_qty"])
-                                                    prev_date = prev[1]["log_date"]
-                                                else:
-                                                    prev_qty = 0
-                                                    prev_date = "1900-01-01"
+                                            tx_after = sb.table("transactions").select(
+                                                "change_qty"
+                                            ).eq("product_id", pid).eq(
+                                                "clinic_id", clinic_id
+                                            ).gt("tx_date", prev_date).execute().data
+                                            restock_total = sum(int(t["change_qty"]) for t in tx_after)
 
-                                                # 加上 prev_date 之後所有進貨
-                                                tx_after = sb.table("transactions").select(
-                                                    "change_qty"
-                                                ).eq("product_id", pid).eq(
-                                                    "clinic_id", clinic_id
-                                                ).gt("tx_date", prev_date).execute().data
-                                                restock_total = sum(int(t["change_qty"]) for t in tx_after)
+                                            sb.table("clinic_stock").update(
+                                                {"current_stock": int(prev_qty + restock_total)}
+                                            ).eq("product_id", pid).eq("clinic_id", clinic_id).execute()
 
-                                                sb.table("clinic_stock").update(
-                                                    {"current_stock": prev_qty + restock_total}
-                                                ).eq("product_id", pid).eq("clinic_id", clinic_id).execute()
-
-                                        sb.table("inventory_logs").delete().eq("session_id", s["id"]).execute()
-                                        sb.table("inventory_sessions").delete().eq("id", s["id"]).execute()
-                                        st.success("已刪除整筆盤點")
-                                        st.rerun()
-                                    except Exception as e:
+                                    sb.table("inventory_logs").delete().eq("session_id", s["id"]).execute()
+                                    sb.table("inventory_sessions").delete().eq("id", s["id"]).execute()
+                                    st.success("已刪除整筆盤點")
+                                    st.rerun()
+                                except Exception as e:
                                         st.error(f"刪除失敗：{e}")
 
 
