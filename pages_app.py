@@ -88,17 +88,18 @@ def short_date(d: str) -> str:
     return d[5:7] + "/" + d[8:10] if d and len(d) >= 10 else d or "-"
 
 
-def style_alternating(df, highlight_col=None):
-    """每 5 行交替底色，可指定特定欄位加重點色"""
-    def row_colors(row):
+def style_banded(df, highlight_col=None):
+    """每 5 行加粗底線分隔，可指定特定欄位加重點色"""
+    def row_style(row):
         idx = row.name if isinstance(row.name, int) else 0
-        bg = "background-color: #F0ECF8" if (idx // 5) % 2 == 1 else ""
-        styles = [bg] * len(row)
+        border = "border-bottom: 2.5px solid #6A5ACD" if (idx + 1) % 5 == 0 else ""
+        styles = [border] * len(row)
         if highlight_col and highlight_col in df.columns:
             col_idx = df.columns.get_loc(highlight_col)
-            styles[col_idx] = "background-color: #E8E0F0; font-weight: bold; border-left: 3px solid #6A5ACD"
+            hl = "background-color: #E8E0F0; font-weight: bold; border-left: 3px solid #6A5ACD"
+            styles[col_idx] = hl + ("; " + border if border else "")
         return styles
-    return df.style.apply(row_colors, axis=1)
+    return df.style.apply(row_style, axis=1)
 
 
 # ══════════════════════════════════════════════
@@ -312,35 +313,17 @@ def page_stock_overview():
 
     df = pd.DataFrame(rows)
 
-    # 顯示主表格（唯讀，含交替底色）
-    display_cols = [c for c in df.columns if c != "叫貨"]
-    styled = style_alternating(df[display_cols], highlight_col="即時庫存")
+    # 顯示主表格（含分隔線+即時庫存重點色+叫貨欄）
+    styled = style_banded(df, highlight_col="即時庫存")
     st.dataframe(styled, use_container_width=True, hide_index=True,
                  height=min(len(df) * 35 + 38, 700))
 
-    # 叫貨區塊（可編輯）
-    need_order = df[df["建議叫貨"] > 0].copy()
-    if not need_order.empty:
-        st.divider()
-        st.subheader(f"🛒 需要叫貨（{len(need_order)} 項）")
-
-        order_df = need_order[["品項", "分類", "廠牌1", "即時庫存", "建議叫貨", "叫貨"]].reset_index(drop=True)
-        edited_order = st.data_editor(
-            order_df, use_container_width=True, hide_index=True,
-            column_config={
-                "品項": st.column_config.TextColumn(disabled=True),
-                "分類": st.column_config.TextColumn(disabled=True),
-                "廠牌1": st.column_config.TextColumn(disabled=True),
-                "即時庫存": st.column_config.NumberColumn(disabled=True, format="%d"),
-                "建議叫貨": st.column_config.NumberColumn(disabled=True, format="%d"),
-                "叫貨": st.column_config.NumberColumn("叫貨 ✏️", min_value=0, format="%d"),
-            },
-            key="order_from_stock",
-        )
-
-        final_order = edited_order[edited_order["叫貨"] > 0]
-        if not final_order.empty and st.button("🛒 送出叫貨清單", type="primary"):
-            order_data = final_order[["品項", "分類", "廠牌1", "即時庫存", "叫貨"]].copy()
+    # 送出叫貨
+    order_items = df[df["叫貨"] > 0]
+    if not order_items.empty:
+        st.markdown(f"**共 {len(order_items)} 項建議叫貨**")
+        if st.button("🛒 送出叫貨清單", type="primary"):
+            order_data = order_items[["品項", "分類", "廠牌1", "即時庫存", "叫貨"]].copy()
             order_data.columns = ["品項", "分類", "廠牌", "目前庫存", "叫貨數量"]
 
             st.subheader("叫貨清單")
@@ -541,7 +524,7 @@ def page_transactions():
             } for t in resp.data]
 
             hist_df = pd.DataFrame(hist_rows)
-            styled = style_alternating(hist_df)
+            styled = style_banded(hist_df)
             styled = styled.map(
                 lambda v: "color:#DC3545;font-weight:bold" if isinstance(v, (int, float)) and v < 0 else (
                     "color:#28A745" if isinstance(v, (int, float)) and v > 0 else ""),
@@ -679,7 +662,7 @@ def page_inventory():
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True, type="primary",
             )
-            st.dataframe(style_alternating(print_df), use_container_width=True, hide_index=True, height=300)
+            st.dataframe(style_banded(print_df), use_container_width=True, hide_index=True, height=300)
 
     # ── 執行盤點 ──
     with tab_do:
@@ -1130,7 +1113,7 @@ def page_items():
 
                 st.caption(f"共 {len(df)} 個品項（停用品項=軟刪除，取消勾選「啟用」即可）— {selected_clinic}")
             else:
-                st.dataframe(style_alternating(df), use_container_width=True, hide_index=True, height=min(len(df) * 35 + 38, 600))
+                st.dataframe(style_banded(df), use_container_width=True, hide_index=True, height=min(len(df) * 35 + 38, 600))
                 st.caption(f"共 {len(df)} 個品項 — {selected_clinic}")
 
     with tab_add:
@@ -1268,7 +1251,7 @@ def page_analytics():
 
         if reorder_rows:
             reorder_df = pd.DataFrame(reorder_rows).sort_values(["診所", "分類"]).reset_index(drop=True)
-            st.dataframe(style_alternating(reorder_df),
+            st.dataframe(style_banded(reorder_df),
                          use_container_width=True, hide_index=True)
         else:
             st.success("所有品項庫存充足")
@@ -1290,7 +1273,7 @@ def page_analytics():
         if ranking:
             rank_df = pd.DataFrame(ranking).sort_values("總耗用量", ascending=False).reset_index(drop=True)
             st.bar_chart(rank_df.head(15).set_index("品項")[["總耗用量"]], color="#6A5ACD")
-            st.dataframe(style_alternating(rank_df), use_container_width=True, hide_index=True)
+            st.dataframe(style_banded(rank_df), use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════
