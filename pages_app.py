@@ -83,6 +83,19 @@ def match_search(name: str, key_index: tuple, search_text: str) -> bool:
     return False
 
 
+def get_bopomofo_initial(name: str) -> str:
+    """取得品項名稱第一個字的注音聲母，如 '葛根' -> 'ㄍ'"""
+    for prefix in ("特.", "特級"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    bpmf_list = pinyin(name, style=Style.BOPOMOFO)
+    if bpmf_list and bpmf_list[0]:
+        first = bpmf_list[0][0]
+        return first[0] if first else ""
+    return ""
+
+
 def short_date(d: str) -> str:
     """'2026-03-27' -> '03/27'"""
     return d[5:7] + "/" + d[8:10] if d and len(d) >= 10 else d or "-"
@@ -366,6 +379,43 @@ def page_stock_overview():
                 file_name=f"叫貨單_{selected_clinic}_{date.today()}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True)
+
+    # 匯出庫存表
+    st.divider()
+    if st.button("📥 匯出庫存表 (.xlsx)", use_container_width=True):
+        export_df = df.copy()
+        # 加注音首碼欄
+        export_df.insert(0, "注音", export_df["品項"].apply(get_bopomofo_initial))
+        # 移除叫貨欄（匯出用不到）
+        export_cols = [c for c in export_df.columns if c != "叫貨"]
+        export_df = export_df[export_cols]
+        # None 轉空白
+        export_df = export_df.fillna("")
+
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            # 依分類分頁
+            for cat_name, group in export_df.groupby("分類", sort=False):
+                sheet_name = str(cat_name)[:31]
+                sheet_df = group.drop(columns=["分類"]).reset_index(drop=True)
+                sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+                # 調整欄寬
+                ws = writer.sheets[sheet_name]
+                ws.column_dimensions["A"].width = 5   # 注音
+                ws.column_dimensions["B"].width = 20  # 品項
+                ws.column_dimensions["C"].width = 10  # 廠牌1
+                ws.column_dimensions["D"].width = 10  # 廠牌2
+                for col_letter in "EFGHIJKLMNOP":
+                    ws.column_dimensions[col_letter].width = 10
+
+        st.download_button(
+            "📥 下載庫存表",
+            data=buf.getvalue(),
+            file_name=f"庫存表_{selected_clinic}_{date.today()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True, type="primary",
+        )
 
     # 改錯存檔
     with st.expander("🔧 改錯存檔（修正盤點數量）"):
