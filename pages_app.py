@@ -530,7 +530,7 @@ def page_transactions():
             } for t in resp.data]
 
             hist_df = pd.DataFrame(hist_rows)
-            styled = hist_df.style.applymap(
+            styled = hist_df.style.map(
                 lambda v: "color:#DC3545;font-weight:bold" if isinstance(v, (int, float)) and v < 0 else (
                     "color:#28A745" if isinstance(v, (int, float)) and v > 0 else ""),
                 subset=["數量"],
@@ -830,9 +830,14 @@ def page_inventory():
                 operator = s["users"]["display_name"] if s.get("users") else "-"
                 with st.expander(f"📋 {s['session_date']}（{operator}）", expanded=False):
                     logs = sb.table("inventory_logs").select(
-                        "id, product_id, products(name, units(name)), "
+                        "id, product_id, products(name, category_id, units(name)), "
                         "last_count_qty, restock_qty_since_last, current_count_qty, consumed_qty"
                     ).eq("session_id", s["id"]).execute().data
+                    # 依分類+注音排序
+                    logs = sorted(logs, key=lambda l: (
+                        l["products"].get("category_id", 0),
+                        get_bopomofo_sort_key(l["products"]["name"])
+                    ))
 
                     if not logs:
                         st.info("此盤點批次沒有明細紀錄（可能是空批次）")
