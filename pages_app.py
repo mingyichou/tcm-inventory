@@ -778,19 +778,19 @@ def page_inventory():
                             logs_to_insert, results = [], []
 
                             for idx, count_qty in entries:
-                                product_id = df.iloc[idx]["product_id"]
-                                last_qty = last_count_map.get(product_id, stock_map.get(product_id, 0))
+                                product_id = int(df.iloc[idx]["product_id"])
+                                last_qty = int(last_count_map.get(product_id, stock_map.get(product_id, 0)))
                                 last_dt = last_date_map.get(product_id, "1900-01-01")
 
-                                restock_sum = sum(
+                                restock_sum = int(sum(
                                     int(t["change_qty"]) for t in tx_by_pid.get(product_id, [])
                                     if last_dt < t["tx_date"] <= str(inv_date)
-                                )
-                                consumed = last_qty + restock_sum - count_qty
+                                ))
+                                consumed = int(last_qty + restock_sum - count_qty)
 
                                 logs_to_insert.append({
-                                    "session_id": session_id, "product_id": product_id,
-                                    "clinic_id": clinic_id,
+                                    "session_id": int(session_id), "product_id": product_id,
+                                    "clinic_id": int(clinic_id),
                                     "last_count_qty": last_qty,
                                     "restock_qty_since_last": restock_sum,
                                     "current_count_qty": count_qty,
@@ -799,11 +799,11 @@ def page_inventory():
                                 })
 
                                 # 更新即時庫存（加上盤點日之後的進貨）
-                                restock_after = sum(
+                                restock_after = int(sum(
                                     int(t["change_qty"]) for t in tx_by_pid.get(product_id, [])
                                     if t["tx_date"] > str(inv_date)
-                                )
-                                new_stock = count_qty + restock_after
+                                ))
+                                new_stock = int(count_qty + restock_after)
                                 sb.table("clinic_stock").update(
                                     {"current_stock": new_stock}
                                 ).eq("product_id", product_id).eq("clinic_id", clinic_id).execute()
