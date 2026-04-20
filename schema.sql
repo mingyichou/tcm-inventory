@@ -52,12 +52,15 @@ CREATE TABLE IF NOT EXISTS products (
     UNIQUE(name, category_id)
 );
 
--- 7. 各診所庫存表
+-- 7. 各診所庫存表（含 per-clinic 廠牌與啟用狀態）
 CREATE TABLE IF NOT EXISTS clinic_stock (
     id SERIAL PRIMARY KEY,
     product_id INTEGER NOT NULL REFERENCES products(id),
     clinic_id INTEGER NOT NULL REFERENCES clinics(id),
     current_stock NUMERIC(10,2) NOT NULL DEFAULT 0,
+    brand1_id INTEGER REFERENCES brands(id),
+    brand2_id INTEGER REFERENCES brands(id),
+    is_active BOOLEAN DEFAULT TRUE,
     UNIQUE(product_id, clinic_id)
 );
 
