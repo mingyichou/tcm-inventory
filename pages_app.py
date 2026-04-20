@@ -737,80 +737,86 @@ def page_inventory():
                 st.caption(f"已填 {filled} / {len(edited_df)}")
 
                 if st.button("✅ 確認盤點", type="primary", disabled=(filled == 0)):
-                    try:
-                        session_resp = sb.table("inventory_sessions").insert({
-                            "clinic_id": clinic_id, "session_date": str(inv_date),
-                            "operator_id": user["id"], "status": "已完成",
-                            "completed_at": datetime.now().isoformat(),
-                        }).execute()
-                        session_id = session_resp.data[0]["id"]
+                    # 先收集所有有填數量的項目，避免建立空批次
+                    entries = []
+                    for idx, row in edited_df.iterrows():
+                        if pd.notna(row["盤點數量"]):
+                            entries.append((idx, int(row["盤點數量"])))
 
-                        # 取得每個品項的最新盤點
-                        last_logs = sb.table("inventory_logs").select(
-                            "product_id, current_count_qty, log_date"
-                        ).eq("clinic_id", clinic_id).order("log_date", desc=True).execute().data
+                    if not entries:
+                        st.error("沒有填入任何盤點數量，請重新填寫後再送出。")
+                    else:
+                        try:
+                            # 取得每個品項的最新盤點
+                            last_logs = sb.table("inventory_logs").select(
+                                "product_id, current_count_qty, log_date"
+                            ).eq("clinic_id", clinic_id).order("log_date", desc=True).execute().data
 
-                        last_count_map, last_date_map = {}, {}
-                        for log in last_logs:
-                            pid = log["product_id"]
-                            if pid not in last_count_map:
-                                last_count_map[pid] = int(log["current_count_qty"])
-                                last_date_map[pid] = log["log_date"]
+                            last_count_map, last_date_map = {}, {}
+                            for log in last_logs:
+                                pid = log["product_id"]
+                                if pid not in last_count_map:
+                                    last_count_map[pid] = int(log["current_count_qty"])
+                                    last_date_map[pid] = log["log_date"]
 
-                        all_tx = sb.table("transactions").select(
-                            "product_id, change_qty, tx_date"
-                        ).eq("clinic_id", clinic_id).execute().data
+                            all_tx = sb.table("transactions").select(
+                                "product_id, change_qty, tx_date"
+                            ).eq("clinic_id", clinic_id).execute().data
 
-                        tx_by_pid = defaultdict(list)
-                        for tx in all_tx:
-                            tx_by_pid[tx["product_id"]].append(tx)
+                            tx_by_pid = defaultdict(list)
+                            for tx in all_tx:
+                                tx_by_pid[tx["product_id"]].append(tx)
 
-                        logs_to_insert, results = [], []
+                            # 資料都準備好了，才建立 session
+                            session_resp = sb.table("inventory_sessions").insert({
+                                "clinic_id": clinic_id, "session_date": str(inv_date),
+                                "operator_id": user["id"], "status": "已完成",
+                                "completed_at": datetime.now().isoformat(),
+                            }).execute()
+                            session_id = session_resp.data[0]["id"]
 
-                        for idx, row in edited_df.iterrows():
-                            if pd.isna(row["盤點數量"]):
-                                continue
+                            logs_to_insert, results = [], []
 
-                            product_id = df.iloc[idx]["product_id"]
-                            count_qty = int(row["盤點數量"])
-                            last_qty = last_count_map.get(product_id, stock_map.get(product_id, 0))
-                            last_dt = last_date_map.get(product_id, "1900-01-01")
+                            for idx, count_qty in entries:
+                                product_id = df.iloc[idx]["product_id"]
+                                last_qty = last_count_map.get(product_id, stock_map.get(product_id, 0))
+                                last_dt = last_date_map.get(product_id, "1900-01-01")
 
-                            restock_sum = sum(
-                                int(t["change_qty"]) for t in tx_by_pid.get(product_id, [])
-                                if last_dt < t["tx_date"] <= str(inv_date)
-                            )
-                            consumed = last_qty + restock_sum - count_qty
+                                restock_sum = sum(
+                                    int(t["change_qty"]) for t in tx_by_pid.get(product_id, [])
+                                    if last_dt < t["tx_date"] <= str(inv_date)
+                                )
+                                consumed = last_qty + restock_sum - count_qty
 
-                            logs_to_insert.append({
-                                "session_id": session_id, "product_id": product_id,
-                                "clinic_id": clinic_id,
-                                "last_count_qty": last_qty,
-                                "restock_qty_since_last": restock_sum,
-                                "current_count_qty": count_qty,
-                                "consumed_qty": consumed,
-                                "log_date": str(inv_date),
-                            })
+                                logs_to_insert.append({
+                                    "session_id": session_id, "product_id": product_id,
+                                    "clinic_id": clinic_id,
+                                    "last_count_qty": last_qty,
+                                    "restock_qty_since_last": restock_sum,
+                                    "current_count_qty": count_qty,
+                                    "consumed_qty": consumed,
+                                    "log_date": str(inv_date),
+                                })
 
-                            # 更新即時庫存（加上盤點日之後的進貨）
-                            restock_after = sum(
-                                int(t["change_qty"]) for t in tx_by_pid.get(product_id, [])
-                                if t["tx_date"] > str(inv_date)
-                            )
-                            new_stock = count_qty + restock_after
-                            sb.table("clinic_stock").update(
-                                {"current_stock": new_stock}
-                            ).eq("product_id", product_id).eq("clinic_id", clinic_id).execute()
+                                # 更新即時庫存（加上盤點日之後的進貨）
+                                restock_after = sum(
+                                    int(t["change_qty"]) for t in tx_by_pid.get(product_id, [])
+                                    if t["tx_date"] > str(inv_date)
+                                )
+                                new_stock = count_qty + restock_after
+                                sb.table("clinic_stock").update(
+                                    {"current_stock": new_stock}
+                                ).eq("product_id", product_id).eq("clinic_id", clinic_id).execute()
 
-                            results.append({
-                                "品項": row["品項名稱"], "上次盤點": last_qty,
-                                "期間進貨": restock_sum, "本次盤點": count_qty, "耗用量": consumed,
-                            })
+                                results.append({
+                                    "品項": edited_df.iloc[idx]["品項名稱"],
+                                    "上次盤點": last_qty,
+                                    "期間進貨": restock_sum, "本次盤點": count_qty, "耗用量": consumed,
+                                })
 
-                        if logs_to_insert:
                             sb.table("inventory_logs").insert(logs_to_insert).execute()
 
-                        st.success(f"盤點完成！共 {len(results)} 個品項（日期：{inv_date}）")
+                            st.success(f"盤點完成！共 {len(results)} 個品項（日期：{inv_date}）")
                         if results:
                             st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
 
