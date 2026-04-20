@@ -1067,24 +1067,46 @@ def page_inventory():
                         if user["role"] == "admin":
                             if st.button("🗑️ 刪除整筆", key=f"hist_del_{s['id']}", type="secondary"):
                                 try:
-                                    for l in logs:
-                                        pid = l["product_id"]
-                                        latest = sb.table("inventory_logs").select(
-                                            "id, log_date"
-                                        ).eq("product_id", pid).eq(
-                                            "clinic_id", clinic_id
-                                        ).order("log_date", desc=True).limit(1).execute().data
+                                    # 檢查是否還有其他盤點 session
+                                    other_sessions = sb.table("inventory_sessions").select(
+                                        "id"
+                                    ).eq("clinic_id", clinic_id).neq(
+                                        "id", s["id"]
+                                    ).limit(1).execute().data
 
-                                        if latest and latest[0]["id"] == l["id"]:
+                                    if not other_sessions:
+                                        # 唯一的盤點 — 刪除後庫存需從進貨重算
+                                        all_tx = sb.table("transactions").select(
+                                            "product_id, change_qty"
+                                        ).eq("clinic_id", clinic_id).execute().data
+                                        tx_sum = defaultdict(int)
+                                        for t in all_tx:
+                                            tx_sum[int(t["product_id"])] += int(t["change_qty"])
+
+                                        # 所有品項庫存歸 0 + 進貨
+                                        all_cs = sb.table("clinic_stock").select(
+                                            "product_id"
+                                        ).eq("clinic_id", clinic_id).execute().data
+                                        for cs_item in all_cs:
+                                            pid = cs_item["product_id"]
+                                            sb.table("clinic_stock").update(
+                                                {"current_stock": tx_sum.get(pid, 0)}
+                                            ).eq("product_id", pid).eq("clinic_id", clinic_id).execute()
+                                    else:
+                                        # 有其他盤點 — 逐品項回退到前一次
+                                        affected_pids = set(l["product_id"] for l in logs)
+                                        for pid in affected_pids:
                                             prev = sb.table("inventory_logs").select(
                                                 "current_count_qty, log_date"
                                             ).eq("product_id", pid).eq(
                                                 "clinic_id", clinic_id
-                                            ).order("log_date", desc=True).limit(2).execute().data
+                                            ).neq("session_id", s["id"]).order(
+                                                "log_date", desc=True
+                                            ).limit(1).execute().data
 
-                                            if len(prev) >= 2:
-                                                prev_qty = int(prev[1]["current_count_qty"])
-                                                prev_date = prev[1]["log_date"]
+                                            if prev:
+                                                prev_qty = int(prev[0]["current_count_qty"])
+                                                prev_date = prev[0]["log_date"]
                                             else:
                                                 prev_qty = 0
                                                 prev_date = "1900-01-01"
@@ -1105,7 +1127,7 @@ def page_inventory():
                                     st.success("已刪除整筆盤點")
                                     st.rerun()
                                 except Exception as e:
-                                        st.error(f"刪除失敗：{e}")
+                                    st.error(f"刪除失敗：{e}")
 
 
 # ══════════════════════════════════════════════
