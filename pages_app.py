@@ -817,11 +817,11 @@ def page_inventory():
                             sb.table("inventory_logs").insert(logs_to_insert).execute()
 
                             st.success(f"盤點完成！共 {len(results)} 個品項（日期：{inv_date}）")
-                        if results:
-                            st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+                            if results:
+                                st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
 
-                    except Exception as e:
-                        st.error(f"盤點失敗：{e}")
+                        except Exception as e:
+                            st.error(f"盤點失敗：{e}")
 
     # ── 盤點歷史 ──
     with tab_history:
