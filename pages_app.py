@@ -316,15 +316,35 @@ def page_stock_overview():
 
     df = pd.DataFrame(rows)
 
-    # 顯示主表格（含分隔線+即時庫存重點色+叫貨欄）
-    styled = style_banded(df, highlight_col="即時庫存")
-    st.dataframe(styled, use_container_width=True, hide_index=True,
-                 height=min(len(df) * 35 + 38, 700))
+    # 主表格（data_editor：叫貨欄可編輯，其餘唯讀）
+    col_config = {
+        "品項": st.column_config.TextColumn(disabled=True),
+        "分類": st.column_config.TextColumn(disabled=True),
+        "廠牌1": st.column_config.TextColumn(disabled=True),
+        "廠牌2": st.column_config.TextColumn(disabled=True),
+        h3: st.column_config.NumberColumn(disabled=True, format="%d"),
+        hr32: st.column_config.NumberColumn(disabled=True, format="%d"),
+        hc32: st.column_config.NumberColumn(disabled=True, format="%d"),
+        h2: st.column_config.NumberColumn(disabled=True, format="%d"),
+        hr21: st.column_config.NumberColumn(disabled=True, format="%d"),
+        hc21: st.column_config.NumberColumn(disabled=True, format="%d"),
+        h1: st.column_config.NumberColumn(disabled=True, format="%d"),
+        "進(迄今)": st.column_config.NumberColumn(disabled=True, format="%d"),
+        "即時庫存": st.column_config.NumberColumn(disabled=True, format="%d"),
+        "建議叫貨": st.column_config.NumberColumn(disabled=True, format="%d"),
+        "叫貨": st.column_config.NumberColumn("叫貨 ✏️", min_value=0, format="%d"),
+    }
+
+    edited_stock_df = st.data_editor(
+        df, use_container_width=True, hide_index=True,
+        height=min(len(df) * 35 + 38, 700),
+        column_config=col_config, key="stock_editor",
+    )
 
     # 送出叫貨
-    order_items = df[df["叫貨"] > 0]
+    order_items = edited_stock_df[edited_stock_df["叫貨"] > 0]
     if not order_items.empty:
-        st.markdown(f"**共 {len(order_items)} 項建議叫貨**")
+        st.markdown(f"**共 {len(order_items)} 項需要叫貨**")
         if st.button("🛒 送出叫貨清單", type="primary"):
             order_data = order_items[["品項", "分類", "廠牌1", "即時庫存", "叫貨"]].copy()
             order_data.columns = ["品項", "分類", "廠牌", "目前庫存", "叫貨數量"]
