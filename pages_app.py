@@ -156,7 +156,7 @@ def page_stock_overview():
     ).execute().data
     products = sort_products_by_bopomofo(products)
 
-    # 載入 per-clinic 資料（廠牌、啟用、庫存）
+    # 載入 per-clinic 資料
     cs_data = sb.table("clinic_stock").select(
         "product_id, current_stock, brand1_id, brand2_id, is_active"
     ).eq("clinic_id", clinic_id).execute().data
@@ -166,7 +166,7 @@ def page_stock_overview():
     all_names = tuple(p["name"] for p in products)
     key_index = build_bopomofo_index(all_names)
 
-    # 載入系統設定（叫貨參數）
+    # 載入系統設定
     settings = sb.table("system_settings").select("*").execute().data
     safety_factor = float(next(s["value"] for s in settings if s["key"] == "safety_factor"))
     stock_multiplier = float(next(s["value"] for s in settings if s["key"] == "stock_target_multiplier"))
@@ -182,7 +182,7 @@ def page_stock_overview():
         if log["consumed_qty"] is not None and log["consumed_qty"] > 0:
             consumed_by_product[log["product_id"]].append(int(log["consumed_qty"]))
 
-    # 取得最近 3 個不重複的盤點日期（作為欄位標題）
+    # 取得最近 3 個不重複的盤點日期
     seen_dates = []
     for log in all_logs:
         d = log["log_date"]
@@ -190,27 +190,44 @@ def page_stock_overview():
             seen_dates.append(d)
         if len(seen_dates) >= 3:
             break
-    # seen_dates: [最新, ..., 最舊]
-    display_dates = list(reversed(seen_dates))  # [最舊→最新] 左到右
+    # seen_dates: [最新, ..., 最舊]; display: 最舊→最新
+    display_dates = list(reversed(seen_dates))
 
-    # 每品項的盤點紀錄 by date
-    product_log_map = defaultdict(dict)  # pid -> {date: log}
+    # 填滿 3 個位置: d3(最舊), d2, d1(最新)
+    d3 = display_dates[0] if len(display_dates) >= 3 else None
+    d2 = display_dates[1] if len(display_dates) >= 3 else (display_dates[0] if len(display_dates) >= 2 else None)
+    d1 = display_dates[-1] if display_dates else None
+
+    sd3 = short_date(d3) if d3 else "-"
+    sd2 = short_date(d2) if d2 else "-"
+    sd1 = short_date(d1) if d1 else "-"
+
+    # 欄位標題
+    h3 = f"盤({sd3})" if d3 else "盤(3)"
+    h2 = f"盤({sd2})" if d2 else "盤(2)"
+    h1 = f"盤({sd1})" if d1 else "盤(1)"
+    hr32 = f"進({sd3}~{sd2})" if d3 and d2 else "進(3~2)"
+    hc32 = f"耗({sd3}~{sd2})" if d3 and d2 else "耗(3~2)"
+    hr21 = f"進({sd2}~{sd1})" if d2 and d1 and d2 != d1 else "進(2~1)"
+    hc21 = f"耗({sd2}~{sd1})" if d2 and d1 and d2 != d1 else "耗(2~1)"
+
+    # 每品項盤點紀錄
+    product_log_map = defaultdict(dict)
     for log in all_logs:
         pid = log["product_id"]
         d = log["log_date"]
-        if d in seen_dates and d not in product_log_map[pid]:
+        if d not in product_log_map[pid]:
             product_log_map[pid][d] = log
 
-    # 載入進退貨
+    # 進退貨
     all_tx = sb.table("transactions").select(
         "product_id, change_qty, tx_date"
     ).eq("clinic_id", clinic_id).order("tx_date").execute().data
-
     tx_by_product = defaultdict(list)
     for tx in all_tx:
         tx_by_product[tx["product_id"]].append(tx)
 
-    # 組裝表格
+    # 組裝表格（固定 15 欄）
     rows = []
     product_id_list = []
 
@@ -224,56 +241,55 @@ def page_stock_overview():
         if search and not match_search(p["name"], key_index.get(p["name"], ("", "")), search):
             continue
 
+        p_logs = product_log_map.get(pid, {})
+        log3 = p_logs.get(d3) if d3 else None
+        log2 = p_logs.get(d2) if d2 else None
+        log1 = p_logs.get(d1) if d1 else None
+
+        v3 = int(log3["current_count_qty"]) if log3 else None
+        v2 = int(log2["current_count_qty"]) if log2 else None
+        v1 = int(log1["current_count_qty"]) if log1 else None
+
+        # 進貨 3→2
+        if d3 and d2 and d3 != d2:
+            r32 = sum(int(t["change_qty"]) for t in tx_by_product.get(pid, []) if d3 < t["tx_date"] <= d2)
+        else:
+            r32 = None
+        c32 = (v3 + r32 - v2) if (v3 is not None and v2 is not None and r32 is not None) else None
+
+        # 進貨 2→1
+        if d2 and d1 and d2 != d1:
+            r21 = sum(int(t["change_qty"]) for t in tx_by_product.get(pid, []) if d2 < t["tx_date"] <= d1)
+        else:
+            r21 = None
+        c21 = (v2 + r21 - v1) if (v2 is not None and v1 is not None and r21 is not None) else None
+
+        # 進貨迄今
+        r_now = sum(int(t["change_qty"]) for t in tx_by_product.get(pid, []) if t["tx_date"] > d1) if d1 else 0
+
+        current_stock = int(cs["current_stock"]) if cs else 0
+
+        # 建議叫貨
+        avg_vals = consumed_by_product.get(pid, [])
+        avg_c = sum(avg_vals) / len(avg_vals) if avg_vals else 0
+        if avg_c > 0 and current_stock <= avg_c * safety_factor:
+            suggested = max(0, round(avg_c * stock_multiplier - current_stock))
+        else:
+            suggested = 0
+
         row = {
             "品項": p["name"],
             "分類": p["categories"]["name"],
             "廠牌1": brand_map.get(cs.get("brand1_id"), "-"),
             "廠牌2": brand_map.get(cs.get("brand2_id"), "-"),
+            h3: v3, hr32: r32, hc32: c32,
+            h2: v2, hr21: r21, hc21: c21,
+            h1: v1,
+            "進(迄今)": r_now,
+            "即時庫存": current_stock,
+            "建議叫貨": suggested,
+            "叫貨": suggested,
         }
-
-        p_logs = product_log_map.get(pid, {})
-
-        for i, d in enumerate(display_dates):
-            sd = short_date(d)
-            log = p_logs.get(d)
-            row[f"盤({sd})"] = int(log["current_count_qty"]) if log else "-"
-
-            # 進貨/耗用：這次到下次之間
-            if i < len(display_dates) - 1:
-                next_d = display_dates[i + 1]
-                sn = short_date(next_d)
-                restock = sum(int(t["change_qty"]) for t in tx_by_product.get(pid, [])
-                              if d < t["tx_date"] <= next_d)
-                row[f"進({sd}~{sn})"] = restock
-
-                log_next = p_logs.get(next_d)
-                if log and log_next:
-                    consumed = int(log["current_count_qty"]) + restock - int(log_next["current_count_qty"])
-                    row[f"耗({sd}~{sn})"] = consumed
-                else:
-                    row[f"耗({sd}~{sn})"] = "-"
-
-        # 最新盤點到今天的進貨
-        if display_dates:
-            latest = display_dates[-1]
-            restock_since = sum(int(t["change_qty"]) for t in tx_by_product.get(pid, [])
-                                if t["tx_date"] > latest)
-            row["進(迄今)"] = restock_since
-        else:
-            row["進(迄今)"] = 0
-
-        current_stock = int(cs["current_stock"]) if cs else 0
-        row["即時庫存"] = current_stock
-
-        # 建議叫貨
-        avg_vals = consumed_by_product.get(pid, [])
-        avg_consumed = sum(avg_vals) / len(avg_vals) if avg_vals else 0
-        threshold = avg_consumed * safety_factor
-        if avg_consumed > 0 and current_stock <= threshold:
-            row["建議叫貨"] = max(0, round(avg_consumed * stock_multiplier - current_stock))
-        else:
-            row["建議叫貨"] = 0
-
         rows.append(row)
         product_id_list.append(pid)
 
@@ -283,52 +299,56 @@ def page_stock_overview():
 
     df = pd.DataFrame(rows)
 
-    # 所有欄位設為 disabled，只有「建議叫貨」可編輯
-    col_config = {}
-    for col in df.columns:
-        if col == "建議叫貨":
-            col_config[col] = st.column_config.NumberColumn("建議叫貨 ✏️", min_value=0, format="%d")
-        elif col == "即時庫存":
-            col_config[col] = st.column_config.NumberColumn(disabled=True, format="%d")
-        elif col in ("品項", "分類", "廠牌1", "廠牌2"):
-            col_config[col] = st.column_config.TextColumn(disabled=True)
-        elif any(k in col for k in ("盤", "進", "耗")):
-            col_config[col] = st.column_config.NumberColumn(disabled=True, format="%d") if col not in df.columns or df[col].dtype != object else st.column_config.TextColumn(disabled=True)
+    # 欄位設定：只有「叫貨」可編輯
+    col_config = {
+        "品項": st.column_config.TextColumn(disabled=True),
+        "分類": st.column_config.TextColumn(disabled=True),
+        "廠牌1": st.column_config.TextColumn(disabled=True),
+        "廠牌2": st.column_config.TextColumn(disabled=True),
+        h3: st.column_config.NumberColumn(disabled=True, format="%d"),
+        hr32: st.column_config.NumberColumn(disabled=True, format="%d"),
+        hc32: st.column_config.NumberColumn(disabled=True, format="%d"),
+        h2: st.column_config.NumberColumn(disabled=True, format="%d"),
+        hr21: st.column_config.NumberColumn(disabled=True, format="%d"),
+        hc21: st.column_config.NumberColumn(disabled=True, format="%d"),
+        h1: st.column_config.NumberColumn(disabled=True, format="%d"),
+        "進(迄今)": st.column_config.NumberColumn(disabled=True, format="%d"),
+        "即時庫存": st.column_config.NumberColumn(disabled=True, format="%d"),
+        "建議叫貨": st.column_config.NumberColumn(disabled=True, format="%d"),
+        "叫貨": st.column_config.NumberColumn("叫貨 ✏️", min_value=0, format="%d"),
+    }
 
     edited_stock_df = st.data_editor(
         df, use_container_width=True, hide_index=True,
         height=min(len(df) * 35 + 38, 700),
-        column_config=col_config,
-        key="stock_editor",
+        column_config=col_config, key="stock_editor",
     )
 
-    # 送出叫貨按鈕
-    order_items = edited_stock_df[edited_stock_df["建議叫貨"] > 0]
+    # 送出叫貨
+    order_items = edited_stock_df[edited_stock_df["叫貨"] > 0]
     if not order_items.empty:
         st.markdown(f"**共 {len(order_items)} 項需要叫貨**")
         if st.button("🛒 送出叫貨清單", type="primary"):
-            order_data = order_items[["品項", "分類", "廠牌1", "即時庫存", "建議叫貨"]].copy()
+            order_data = order_items[["品項", "分類", "廠牌1", "即時庫存", "叫貨"]].copy()
             order_data.columns = ["品項", "分類", "廠牌", "目前庫存", "叫貨數量"]
 
             st.subheader("叫貨清單")
-            st.dataframe(order_data, use_container_width=True, hide_index=True)
+            for bname, group in order_data.groupby("廠牌"):
+                if not bname or bname == "-":
+                    bname = "未指定"
+                st.markdown(f"### 【{bname}】")
+                st.dataframe(group[["品項", "叫貨數量"]], use_container_width=True, hide_index=True)
 
-            # 匯出 Excel
             buf = io.BytesIO()
             with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                for brand_name, group in order_data.groupby("廠牌"):
-                    if not brand_name or brand_name == "-":
-                        brand_name = "未指定"
-                    group[["品項", "叫貨數量"]].to_excel(
-                        writer, sheet_name=str(brand_name)[:31], index=False)
-
-            st.download_button(
-                "📥 下載叫貨單 (.xlsx)",
-                data=buf.getvalue(),
+                for bname, group in order_data.groupby("廠牌"):
+                    if not bname or bname == "-":
+                        bname = "未指定"
+                    group[["品項", "叫貨數量"]].to_excel(writer, sheet_name=str(bname)[:31], index=False)
+            st.download_button("📥 下載叫貨單 (.xlsx)", data=buf.getvalue(),
                 file_name=f"叫貨單_{selected_clinic}_{date.today()}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+                use_container_width=True)
 
     # 改錯存檔
     with st.expander("🔧 改錯存檔（修正盤點數量）"):
