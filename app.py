@@ -15,25 +15,7 @@ st.set_page_config(
 # 全域 CSS
 st.markdown("""
 <style>
-    /* 每 5 行交替底色：1-5 淺色, 6-10 深色 */
-    .stDataFrame tbody tr:nth-child(10n+1),
-    .stDataFrame tbody tr:nth-child(10n+2),
-    .stDataFrame tbody tr:nth-child(10n+3),
-    .stDataFrame tbody tr:nth-child(10n+4),
-    .stDataFrame tbody tr:nth-child(10n+5) {
-        background-color: rgba(106, 90, 205, 0.04) !important;
-    }
-    .stDataFrame tbody tr:nth-child(10n+6),
-    .stDataFrame tbody tr:nth-child(10n+7),
-    .stDataFrame tbody tr:nth-child(10n+8),
-    .stDataFrame tbody tr:nth-child(10n+9),
-    .stDataFrame tbody tr:nth-child(10n+10) {
-        background-color: rgba(106, 90, 205, 0.12) !important;
-    }
-    /* 每 5 行底部分隔線 */
-    .stDataFrame tbody tr:nth-child(5n) {
-        border-bottom: 1px solid rgba(106, 90, 205, 0.3) !important;
-    }
+    /* 交替底色由 pandas Styler 控制 */
     .sidebar-title {
         font-size: 1.3rem;
         font-weight: 700;
