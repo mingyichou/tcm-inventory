@@ -153,6 +153,181 @@ def get_clinic_id(clinic_name: str) -> int | None:
 
 
 # ══════════════════════════════════════════════
+#  廠牌縮寫
+# ══════════════════════════════════════════════
+BRAND_ABBR = {"莊松榮": "松", "港香蘭": "港", "天一": "一", "科達": "科", "順天堂": "順", "仙豐": "仙"}
+
+def abbr_brand(name):
+    return BRAND_ABBR.get(name, name) if name and name != "-" else ""
+
+
+# ══════════════════════════════════════════════
+#  庫存表 Excel 產生器
+# ══════════════════════════════════════════════
+
+def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
+    """產生庫存表 Excel：每分類一頁，注音分組+雙線分隔，A4 直式"""
+    from openpyxl.styles import Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    # 簡化欄位標題
+    col_map = {h3: h3.replace("盤(", "").replace(")", ""),
+               hr32: "進貨", hc32: "耗用",
+               h2: h2.replace("盤(", "").replace(")", ""),
+               hr21: "進貨", hc21: "耗用",
+               h1: h1.replace("盤(", "").replace(")", "")}
+
+    # 要輸出的欄位（去掉進(迄今)、即時庫存、叫貨）
+    export_cols = ["品項", "廠牌1", "廠牌2",
+                   h3, hr32, hc32, h2, hr21, hc21, h1, "建議叫貨"]
+    # 過濾實際存在的欄位
+    export_cols = [c for c in export_cols if c in df.columns]
+
+    buf = io.BytesIO()
+    from openpyxl import Workbook
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    thin = Side(style="thin")
+    double = Side(style="double")
+    header_font = Font(bold=True, size=10)
+    data_font = Font(size=9)
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+
+    for cat_name, cat_group in df.groupby("分類", sort=False):
+        ws = wb.create_sheet(title=str(cat_name)[:31])
+        ws.page_setup.orientation = "portrait"
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+        # 寫表頭
+        headers = ["注音", "品項", "廠1", "廠2"]
+        for c in export_cols:
+            if c in ("品項", "廠牌1", "廠牌2"):
+                continue
+            headers.append(col_map.get(c, c))
+
+        for ci, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=ci, value=h)
+            cell.font = header_font
+            cell.alignment = center
+            cell.border = Border(bottom=thin)
+
+        # 欄寬
+        col_widths = [4, 16, 3, 3] + [6] * (len(headers) - 4)
+        for ci, w in enumerate(col_widths, 1):
+            ws.column_dimensions[get_column_letter(ci)].width = w
+
+        # 寫資料
+        row_num = 2
+        prev_initial = None
+        cat_data = cat_group.reset_index(drop=True)
+
+        for _, r in cat_data.iterrows():
+            initial = get_bopomofo_initial(r["品項"])
+
+            # 注音分組切換 → 加雙線
+            if prev_initial is not None and initial != prev_initial:
+                # 在上一行加雙線底邊
+                for ci in range(1, len(headers) + 1):
+                    cell = ws.cell(row=row_num - 1, column=ci)
+                    old = cell.border
+                    cell.border = Border(left=old.left, right=old.right,
+                                         top=old.top, bottom=double)
+
+            # 注音欄：只在每組第一個顯示
+            show_initial = initial if initial != prev_initial else ""
+            prev_initial = initial
+
+            vals = [show_initial, r["品項"], abbr_brand(r["廠牌1"]), abbr_brand(r["廠牌2"])]
+            for c in export_cols:
+                if c in ("品項", "廠牌1", "廠牌2"):
+                    continue
+                v = r.get(c)
+                vals.append(int(v) if pd.notna(v) and v != "" else "")
+
+            for ci, v in enumerate(vals, 1):
+                cell = ws.cell(row=row_num, column=ci, value=v)
+                cell.font = data_font
+                cell.alignment = center if ci != 2 else left
+
+            row_num += 1
+
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ══════════════════════════════════════════════
+#  叫貨單 Excel 產生器
+# ══════════════════════════════════════════════
+
+def _build_order_excel(order_data):
+    """產生叫貨單 Excel：單一 sheet，依廠牌分區，4 欄品項+數量"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "叫貨單"
+    ws.page_setup.orientation = "portrait"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    # 欄寬：品項|數量 x4
+    for i in range(4):
+        ws.column_dimensions[get_column_letter(i * 2 + 1)].width = 14
+        ws.column_dimensions[get_column_letter(i * 2 + 2)].width = 5
+
+    brand_font = Font(bold=True, size=11)
+    header_font = Font(bold=True, size=9)
+    data_font = Font(size=9)
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+
+    row_num = 1
+
+    for brand_name, group in order_data.groupby("廠牌"):
+        if not brand_name or brand_name == "-":
+            brand_name = "未指定"
+
+        # 廠牌標題
+        cell = ws.cell(row=row_num, column=1, value=brand_name)
+        cell.font = brand_font
+        row_num += 1
+
+        # 表頭
+        for i in range(4):
+            ws.cell(row=row_num, column=i * 2 + 1, value="品項").font = header_font
+            ws.cell(row=row_num, column=i * 2 + 2, value="數量").font = header_font
+        row_num += 1
+
+        # 資料：4 欄排列
+        items = list(group.itertuples(index=False))
+        for chunk_start in range(0, len(items), 4):
+            chunk = items[chunk_start:chunk_start + 4]
+            for i, item in enumerate(chunk):
+                ws.cell(row=row_num, column=i * 2 + 1, value=item.品項).font = data_font
+                qty_cell = ws.cell(row=row_num, column=i * 2 + 2, value=int(item.叫貨數量))
+                qty_cell.font = data_font
+                qty_cell.alignment = center
+            row_num += 1
+
+        row_num += 1  # 廠牌間空一行
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+# ══════════════════════════════════════════════
 #  1. 庫存總覽頁面
 # ══════════════════════════════════════════════
 
@@ -369,13 +544,8 @@ def page_stock_overview():
                 st.markdown(f"### 【{bname}】")
                 st.dataframe(group[["品項", "叫貨數量"]], use_container_width=True, hide_index=True)
 
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                for bname, group in order_data.groupby("廠牌"):
-                    if not bname or bname == "-":
-                        bname = "未指定"
-                    group[["品項", "叫貨數量"]].to_excel(writer, sheet_name=str(bname)[:31], index=False)
-            st.download_button("📥 下載叫貨單 (.xlsx)", data=buf.getvalue(),
+            buf = _build_order_excel(order_data)
+            st.download_button("📥 下載叫貨單 (.xlsx)", data=buf,
                 file_name=f"叫貨單_{selected_clinic}_{date.today()}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True)
@@ -383,35 +553,10 @@ def page_stock_overview():
     # 匯出庫存表
     st.divider()
     if st.button("📥 匯出庫存表 (.xlsx)", use_container_width=True):
-        export_df = df.copy()
-        # 加注音首碼欄
-        export_df.insert(0, "注音", export_df["品項"].apply(get_bopomofo_initial))
-        # 移除叫貨欄（匯出用不到）
-        export_cols = [c for c in export_df.columns if c != "叫貨"]
-        export_df = export_df[export_cols]
-        # None 轉空白
-        export_df = export_df.fillna("")
-
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            # 依分類分頁
-            for cat_name, group in export_df.groupby("分類", sort=False):
-                sheet_name = str(cat_name)[:31]
-                sheet_df = group.drop(columns=["分類"]).reset_index(drop=True)
-                sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
-
-                # 調整欄寬
-                ws = writer.sheets[sheet_name]
-                ws.column_dimensions["A"].width = 5   # 注音
-                ws.column_dimensions["B"].width = 20  # 品項
-                ws.column_dimensions["C"].width = 10  # 廠牌1
-                ws.column_dimensions["D"].width = 10  # 廠牌2
-                for col_letter in "EFGHIJKLMNOP":
-                    ws.column_dimensions[col_letter].width = 10
-
+        buf = _build_stock_excel(df, selected_clinic, h3, hr32, hc32, h2, hr21, hc21, h1)
         st.download_button(
             "📥 下載庫存表",
-            data=buf.getvalue(),
+            data=buf,
             file_name=f"庫存表_{selected_clinic}_{date.today()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True, type="primary",
