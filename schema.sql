@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS clinic_stock (
     brand1_id INTEGER REFERENCES brands(id),
     brand2_id INTEGER REFERENCES brands(id),
     is_active BOOLEAN DEFAULT TRUE,
+    cabinet VARCHAR(20),
     UNIQUE(product_id, clinic_id)
 );
 

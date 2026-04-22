@@ -236,10 +236,11 @@ def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
     # 組裝欄位：注音, 品項, 廠1, 廠2, [期間欄位...], 建議叫貨
     # 欄寬配合 A4 直式（總寬約 85 單位）
     col_specs = []  # (header_name, df_col_or_None, width)
-    col_specs.append(("注音", None, 5))
-    col_specs.append(("品項", "品項", 22))
-    col_specs.append(("廠1", "廠牌1", 5))
-    col_specs.append(("廠2", "廠牌2", 5))
+    col_specs.append(("注音", None, 4))
+    col_specs.append(("品項", "品項", 19))
+    col_specs.append(("櫃", "櫃位", 4))
+    col_specs.append(("廠1", "廠牌1", 4))
+    col_specs.append(("廠2", "廠牌2", 4))
 
     for i, (h_inv, h_restock, h_consume, date_label) in enumerate(periods):
         if h_restock and h_consume:
@@ -272,6 +273,8 @@ def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
                     val = show_initial
                 elif df_col == "品項":
                     val = r["品項"]
+                elif df_col == "櫃位":
+                    val = r.get("櫃位", "") or ""
                 elif df_col == "廠牌1":
                     val = abbr_brand(r["廠牌1"])
                 elif df_col == "廠牌2":
@@ -461,7 +464,7 @@ def page_stock_overview():
 
     # 載入 per-clinic 資料
     cs_data = sb.table("clinic_stock").select(
-        "product_id, current_stock, brand1_id, brand2_id, is_active"
+        "product_id, current_stock, brand1_id, brand2_id, is_active, cabinet"
     ).eq("clinic_id", clinic_id).execute().data
     cs_map = {s["product_id"]: s for s in cs_data}
 
@@ -583,6 +586,7 @@ def page_stock_overview():
         row = {
             "品項": p["name"],
             "分類": p["categories"]["name"],
+            "櫃位": cs.get("cabinet") or "",
             "廠牌1": brand_map.get(cs.get("brand1_id"), "-"),
             "廠牌2": brand_map.get(cs.get("brand2_id"), "-"),
             h3: v3, hr32: r32, hc32: c32,
@@ -607,6 +611,7 @@ def page_stock_overview():
         "品項": st.column_config.TextColumn(disabled=True),
         "分類": st.column_config.TextColumn(disabled=True),
         "廠牌1": st.column_config.TextColumn(disabled=True),
+        "櫃位": st.column_config.TextColumn(disabled=True),
         "廠牌2": st.column_config.TextColumn(disabled=True),
         h3: st.column_config.NumberColumn(disabled=True, format="%d"),
         hr32: st.column_config.NumberColumn(disabled=True, format="%d"),
@@ -917,10 +922,10 @@ def page_inventory():
         products = sort_products_by_bopomofo(products)
 
         # per-clinic 啟用
-        cs_active = sb.table("clinic_stock").select("product_id, is_active").eq("clinic_id", clinic_id).execute().data
-        active_set = {s["product_id"] for s in cs_active if s.get("is_active", True)}
-        # Note: print products don't have id, need to filter differently
-        # Actually we need id for filtering, let me reload with id
+        cs_print = sb.table("clinic_stock").select("product_id, is_active, cabinet").eq("clinic_id", clinic_id).execute().data
+        active_set = {s["product_id"] for s in cs_print if s.get("is_active", True)}
+        cab_map = {s["product_id"]: s.get("cabinet") or "" for s in cs_print}
+
         products_with_id = sb.table("products").select(
             "id, name, category_id, categories(name), units(name)"
         ).execute().data
@@ -930,7 +935,8 @@ def page_inventory():
         if print_cat != "全部":
             products_with_id = [p for p in products_with_id if p["categories"]["name"] == print_cat]
 
-        print_rows = [{"品項名稱": p["name"], "分類": p["categories"]["name"],
+        print_rows = [{"品項名稱": p["name"], "櫃位": cab_map.get(p["id"], ""),
+                       "分類": p["categories"]["name"],
                        "單位": p["units"]["name"], "盤點數量": ""} for p in products_with_id]
 
         if print_rows:
@@ -1313,7 +1319,7 @@ def page_items():
 
     # 載入 per-clinic 資料
     cs_data = sb.table("clinic_stock").select(
-        "product_id, brand1_id, brand2_id, is_active"
+        "product_id, brand1_id, brand2_id, is_active, cabinet"
     ).eq("clinic_id", clinic_id).execute().data
     cs_map = {s["product_id"]: s for s in cs_data}
 
@@ -1353,6 +1359,7 @@ def page_items():
 
             rows.append({
                 "品項名稱": p["name"], "分類": p["categories"]["name"], "單位": p["units"]["name"],
+                "櫃位": cs.get("cabinet") or "",
                 "第一廠牌": brand_map.get(cs.get("brand1_id"), "-"),
                 "第二廠牌": brand_map.get(cs.get("brand2_id"), "-"),
                 "規格": p["spec_note"] or "-", "啟用": is_active,
@@ -1371,6 +1378,7 @@ def page_items():
                         "品項名稱": st.column_config.TextColumn(),
                         "分類": st.column_config.SelectboxColumn(options=cat_names),
                         "單位": st.column_config.SelectboxColumn(options=unit_names),
+                        "櫃位": st.column_config.TextColumn(),
                         "第一廠牌": st.column_config.SelectboxColumn(options=brand_names),
                         "第二廠牌": st.column_config.SelectboxColumn(options=brand_names),
                         "規格": st.column_config.TextColumn(),
@@ -1402,6 +1410,8 @@ def page_items():
 
                         # per-clinic 欄位 → 更新 clinic_stock 表
                         cs_changes = {}
+                        if old.get("櫃位", "") != new.get("櫃位", ""):
+                            cs_changes["cabinet"] = new["櫃位"] if new["櫃位"] else None
                         if old["第一廠牌"] != new["第一廠牌"]:
                             cs_changes["brand1_id"] = next((b["id"] for b in brands if b["name"] == new["第一廠牌"]), None)
                         if old["第二廠牌"] != new["第二廠牌"]:
@@ -1528,7 +1538,7 @@ def page_analytics():
             "unit": log["products"]["units"]["name"],
         }
 
-    tab_reorder, tab_ranking = st.tabs(["📦 建議叫貨", "🏆 常用排名"])
+    tab_reorder, tab_ranking, tab_cabinet = st.tabs(["📦 建議叫貨", "🏆 常用排名", "🗄️ 櫃位分類"])
 
     with tab_reorder:
         settings = sb.table("system_settings").select("*").execute().data
@@ -1583,6 +1593,87 @@ def page_analytics():
             rank_df = pd.DataFrame(ranking).sort_values("總耗用量", ascending=False).reset_index(drop=True)
             st.bar_chart(rank_df.head(15).set_index("品項")[["總耗用量"]], color="#6A5ACD")
             st.dataframe(style_banded(rank_df), use_container_width=True, hide_index=True)
+
+    with tab_cabinet:
+        if selected_clinic == "合併檢視":
+            st.info("請先選擇單一診所。")
+        else:
+            cab_clinic_id = get_clinic_id(selected_clinic)
+            cab_sb = get_supabase_client()
+            cab_products = cab_sb.table("products").select(
+                "id, name, category_id, categories(name), units(name)"
+            ).execute().data
+            cab_products = sort_products_by_bopomofo(cab_products)
+
+            cab_cs = cab_sb.table("clinic_stock").select(
+                "product_id, current_stock, cabinet, is_active, brand1_id, brand2_id"
+            ).eq("clinic_id", cab_clinic_id).execute().data
+            cab_cs_map = {s["product_id"]: s for s in cab_cs}
+
+            cab_brands = load_brands()
+            cab_brand_map = {b["id"]: b["name"] for b in cab_brands}
+
+            cab_rows = []
+            for p in cab_products:
+                cs = cab_cs_map.get(p["id"])
+                if not cs or not cs.get("is_active", True):
+                    continue
+                cab_rows.append({
+                    "櫃位": cs.get("cabinet") or "(未設定)",
+                    "品項": p["name"],
+                    "分類": p["categories"]["name"],
+                    "單位": p["units"]["name"],
+                    "廠牌1": cab_brand_map.get(cs.get("brand1_id"), "-"),
+                    "廠牌2": cab_brand_map.get(cs.get("brand2_id"), "-"),
+                    "即時庫存": int(cs["current_stock"]),
+                })
+
+            if cab_rows:
+                cab_df = pd.DataFrame(cab_rows).sort_values(["櫃位", "分類"]).reset_index(drop=True)
+                st.dataframe(style_banded(cab_df), use_container_width=True, hide_index=True)
+
+                # 匯出
+                if st.button("📥 匯出櫃位分類表", type="primary"):
+                    buf = io.BytesIO()
+                    from openpyxl.styles import Font, Border, Side, Alignment
+                    from openpyxl import Workbook
+                    from openpyxl.utils import get_column_letter
+
+                    thin_s = Side(style="thin")
+                    border_t = Border(left=thin_s, right=thin_s, top=thin_s, bottom=thin_s)
+
+                    wb = Workbook()
+                    ws = wb.active
+                    ws.title = f"櫃位分類_{selected_clinic}"
+                    ws.page_setup.orientation = "portrait"
+                    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+                    ws.page_setup.fitToWidth = 1
+                    ws.page_setup.fitToHeight = 0
+                    ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+                    headers = ["櫃位", "品項", "分類", "單位", "廠牌1", "廠牌2", "即時庫存"]
+                    widths = [6, 20, 12, 6, 8, 8, 8]
+                    for ci, (h, w) in enumerate(zip(headers, widths), 1):
+                        cell = ws.cell(row=1, column=ci, value=h)
+                        cell.font = Font(bold=True, size=11)
+                        cell.border = border_t
+                        cell.alignment = Alignment(horizontal="center")
+                        ws.column_dimensions[get_column_letter(ci)].width = w
+
+                    for ri, (_, row) in enumerate(cab_df.iterrows(), 2):
+                        for ci, h in enumerate(headers, 1):
+                            cell = ws.cell(row=ri, column=ci, value=row[h])
+                            cell.font = Font(size=11)
+                            cell.border = border_t
+
+                    wb.save(buf)
+                    buf.seek(0)
+                    st.download_button("📥 下載", data=buf.getvalue(),
+                        file_name=f"櫃位分類_{selected_clinic}_{date.today()}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True)
+            else:
+                st.info("尚無品項資料")
 
 
 # ══════════════════════════════════════════════
