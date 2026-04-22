@@ -252,40 +252,19 @@ def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
 
     col_specs.append(("建議叫貨", "建議叫貨", 6))
 
-    buf = io.BytesIO()
-    wb = Workbook()
-    wb.remove(wb.active)
+    # 品項少的分類合併為一頁
+    MERGE_CATS = {"水藥材", "高貴藥材", "非健保藥材"}
 
-    for cat_name, cat_group in df.groupby("分類", sort=False):
-        ws = wb.create_sheet(title=str(cat_name)[:31])
-        ws.page_setup.orientation = "portrait"
-        ws.page_setup.paperSize = ws.PAPERSIZE_A4
-        ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 0
-        ws.sheet_properties.pageSetUpPr.fitToPage = True
-
-        # 表頭
-        for ci, (header, _, width) in enumerate(col_specs, 1):
-            cell = ws.cell(row=1, column=ci, value=header)
-            cell.font = header_font
-            cell.alignment = center
-            cell.border = border_thin
-            ws.column_dimensions[get_column_letter(ci)].width = width
-
-        # 資料
-        row_num = 2
+    def _write_cat_data(ws, cat_data, col_specs, start_row):
+        """寫入一個分類的資料，回傳下一個可用行號"""
+        row_num = start_row
         prev_initial = None
-        cat_data = cat_group.reset_index(drop=True)
-
         for _, r in cat_data.iterrows():
             initial = get_bopomofo_initial(r["品項"])
-
-            # 注音分組切換 → 上一行改雙線底邊
             if prev_initial is not None and initial != prev_initial:
                 for ci in range(1, len(col_specs) + 1):
                     cell = ws.cell(row=row_num - 1, column=ci)
                     cell.border = Border(left=thin, right=thin, top=thin, bottom=double)
-
             show_initial = initial if initial != prev_initial else ""
             prev_initial = initial
 
@@ -303,13 +282,68 @@ def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
                     val = int(v) if pd.notna(v) and v != "" else ""
                 else:
                     val = ""
-
                 cell = ws.cell(row=row_num, column=ci, value=val)
                 cell.font = data_font
                 cell.alignment = left_align if df_col == "品項" else center
                 cell.border = border_thin
-
             row_num += 1
+        return row_num
+
+    def _write_header(ws, col_specs, row=1):
+        for ci, (header, _, width) in enumerate(col_specs, 1):
+            cell = ws.cell(row=row, column=ci, value=header)
+            cell.font = header_font
+            cell.alignment = center
+            cell.border = border_thin
+            ws.column_dimensions[get_column_letter(ci)].width = width
+
+    def _setup_page(ws):
+        ws.page_setup.orientation = "portrait"
+        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+    buf = io.BytesIO()
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    cat_title_font = Font(bold=True, size=11)
+
+    # 分組：一般分類各自一頁，合併分類集中一頁
+    grouped = df.groupby("分類", sort=False)
+    merge_groups = []
+
+    for cat_name, cat_group in grouped:
+        if cat_name in MERGE_CATS:
+            merge_groups.append((cat_name, cat_group))
+        else:
+            # 獨立一頁
+            ws = wb.create_sheet(title=str(cat_name)[:31])
+            _setup_page(ws)
+            _write_header(ws, col_specs)
+            _write_cat_data(ws, cat_group.reset_index(drop=True), col_specs, 2)
+
+    # 合併分類集中一頁
+    if merge_groups:
+        ws = wb.create_sheet(title="其他藥材")
+        _setup_page(ws)
+        _write_header(ws, col_specs)
+        row_num = 2
+
+        for idx, (cat_name, cat_group) in enumerate(merge_groups):
+            # 分類標題行
+            cell = ws.cell(row=row_num, column=1, value=f"【{cat_name}】")
+            cell.font = cat_title_font
+            ws.merge_cells(start_row=row_num, start_column=1,
+                           end_row=row_num, end_column=len(col_specs))
+            row_num += 1
+
+            row_num = _write_cat_data(ws, cat_group.reset_index(drop=True), col_specs, row_num)
+
+            # 分類間空 2 行（無格線）
+            if idx < len(merge_groups) - 1:
+                row_num += 2
 
     wb.save(buf)
     buf.seek(0)
