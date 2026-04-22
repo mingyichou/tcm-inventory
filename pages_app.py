@@ -152,6 +152,38 @@ def get_clinic_id(clinic_name: str) -> int | None:
     return resp.data[0]["id"] if resp.data else None
 
 
+def recalc_stock(product_id: int, clinic_id: int):
+    """重算即時庫存 = 最後一次盤點數量 + 該盤點日期之後的進貨（依 tx_date）"""
+    sb = get_supabase_client()
+    # 找最後一次盤點
+    last_log = sb.table("inventory_logs").select(
+        "current_count_qty, log_date"
+    ).eq("product_id", product_id).eq(
+        "clinic_id", clinic_id
+    ).order("log_date", desc=True).limit(1).execute().data
+
+    if last_log:
+        base_qty = int(last_log[0]["current_count_qty"])
+        last_date = last_log[0]["log_date"]
+    else:
+        base_qty = 0
+        last_date = "1900-01-01"
+
+    # 加上最後盤點日期之後的進貨
+    tx_after = sb.table("transactions").select(
+        "change_qty"
+    ).eq("product_id", product_id).eq(
+        "clinic_id", clinic_id
+    ).gt("tx_date", last_date).execute().data
+    restock = sum(int(t["change_qty"]) for t in tx_after)
+
+    new_stock = int(base_qty + restock)
+    sb.table("clinic_stock").update(
+        {"current_stock": new_stock}
+    ).eq("product_id", product_id).eq("clinic_id", clinic_id).execute()
+    return new_stock
+
+
 # ══════════════════════════════════════════════
 #  廠牌縮寫
 # ══════════════════════════════════════════════
@@ -591,16 +623,7 @@ def page_stock_overview():
                         {"current_count_qty": new_qty}
                     ).eq("id", fix_log["id"]).execute()
 
-                    if fix_log == fix_logs[0]:
-                        restock_after = sum(
-                            int(t["change_qty"]) for t in tx_by_product.get(fix_pid, [])
-                            if t["tx_date"] > fix_log["log_date"]
-                        )
-                        new_stock = new_qty + restock_after
-                        sb.table("clinic_stock").update(
-                            {"current_stock": new_stock}
-                        ).eq("product_id", fix_pid).eq("clinic_id", clinic_id).execute()
-
+                    recalc_stock(fix_pid, clinic_id)
                     st.success(f"已修正：{selected_name} {fix_log['log_date']} → {new_qty}")
                 except Exception as e:
                     st.error(f"修正失敗：{e}")
@@ -701,12 +724,8 @@ def page_transactions():
                             "tx_type": tx_type, "note": full_note, "created_by": user["id"],
                         }).execute()
 
-                        new_stock = current_stock + qty
-                        sb.table("clinic_stock").update(
-                            {"current_stock": new_stock}
-                        ).eq("product_id", product["id"]).eq("clinic_id", clinic_id).execute()
-
-                        st.success(f"已登錄：{product['name']} {qty:+d}（庫存 {current_stock} → {new_stock}）")
+                        new_stock = recalc_stock(product["id"], clinic_id)
+                        st.success(f"已登錄：{product['name']} {qty:+d}（即時庫存：{new_stock}）")
                     except Exception as e:
                         st.error(f"登錄失敗：{e}")
 
@@ -775,18 +794,11 @@ def page_transactions():
             with col_save:
                 if st.button("💾 修改此筆", type="primary", key="tx_save_btn"):
                     try:
-                        diff = edit_qty - int(tx_item["change_qty"])
                         sb.table("transactions").update({
                             "change_qty": edit_qty, "tx_type": edit_type,
                             "note": edit_note or None,
                         }).eq("id", tx_item["id"]).execute()
-                        if diff != 0:
-                            fresh = sb.table("clinic_stock").select("current_stock").eq(
-                                "product_id", tx_item["product_id"]).eq("clinic_id", clinic_id).execute().data
-                            old_stock = int(fresh[0]["current_stock"]) if fresh else 0
-                            sb.table("clinic_stock").update(
-                                {"current_stock": old_stock + diff}
-                            ).eq("product_id", tx_item["product_id"]).eq("clinic_id", clinic_id).execute()
+                        recalc_stock(tx_item["product_id"], clinic_id)
                         st.success("已修改")
                         st.rerun()
                     except Exception as e:
@@ -795,14 +807,8 @@ def page_transactions():
             with col_del:
                 if st.button("🗑️ 刪除此筆", type="secondary", key="tx_del_btn"):
                     try:
-                        old_qty = int(tx_item["change_qty"])
-                        fresh = sb.table("clinic_stock").select("current_stock").eq(
-                            "product_id", tx_item["product_id"]).eq("clinic_id", clinic_id).execute().data
-                        old_stock = int(fresh[0]["current_stock"]) if fresh else 0
-                        sb.table("clinic_stock").update(
-                            {"current_stock": old_stock - old_qty}
-                        ).eq("product_id", tx_item["product_id"]).eq("clinic_id", clinic_id).execute()
                         sb.table("transactions").delete().eq("id", tx_item["id"]).execute()
+                        recalc_stock(tx_item["product_id"], clinic_id)
                         st.success("已刪除")
                         st.rerun()
                     except Exception as e:
@@ -1011,23 +1017,17 @@ def page_inventory():
                                     "log_date": str(inv_date),
                                 })
 
-                                # 更新即時庫存（加上盤點日之後的進貨）
-                                restock_after = int(sum(
-                                    int(t["change_qty"]) for t in tx_by_pid.get(product_id, [])
-                                    if t["tx_date"] > str(inv_date)
-                                ))
-                                new_stock = int(count_qty + restock_after)
-                                sb.table("clinic_stock").update(
-                                    {"current_stock": new_stock}
-                                ).eq("product_id", product_id).eq("clinic_id", clinic_id).execute()
-
                                 results.append({
                                     "品項": edited_df.iloc[idx]["品項名稱"],
                                     "上次盤點": last_qty,
                                     "期間進貨": restock_sum, "本次盤點": count_qty, "耗用量": consumed,
                                 })
 
+                            # 先寫入 logs，再重算庫存（recalc 要抓到新寫入的盤點）
                             sb.table("inventory_logs").insert(logs_to_insert).execute()
+
+                            for entry in logs_to_insert:
+                                recalc_stock(entry["product_id"], int(clinic_id))
 
                             st.success(f"盤點完成！共 {len(results)} 個品項（日期：{inv_date}）")
                             if results:
@@ -1182,20 +1182,8 @@ def page_inventory():
                                     }).execute()
                                     inserted += 1
 
-                                # 更新即時庫存（如果是最新盤點）
-                                latest_check = sb.table("inventory_logs").select(
-                                    "log_date"
-                                ).eq("product_id", pid).eq(
-                                    "clinic_id", clinic_id
-                                ).order("log_date", desc=True).limit(1).execute().data
-                                if latest_check and latest_check[0]["log_date"] <= s["session_date"]:
-                                    restock_after = int(sum(
-                                        int(t["change_qty"]) for t in tx_by_pid.get(pid, [])
-                                        if t["tx_date"] > s["session_date"]
-                                    ))
-                                    sb.table("clinic_stock").update(
-                                        {"current_stock": int(new_qty + restock_after)}
-                                    ).eq("product_id", pid).eq("clinic_id", clinic_id).execute()
+                                # 重算即時庫存
+                                recalc_stock(int(pid), int(clinic_id))
 
                             msg = []
                             if updated > 0:
@@ -1212,63 +1200,17 @@ def page_inventory():
                         if user["role"] == "admin":
                             if st.button("🗑️ 刪除整筆", key=f"hist_del_{s['id']}", type="secondary"):
                                 try:
-                                    # 檢查是否還有其他盤點 session
-                                    other_sessions = sb.table("inventory_sessions").select(
-                                        "id"
-                                    ).eq("clinic_id", clinic_id).neq(
-                                        "id", s["id"]
-                                    ).limit(1).execute().data
+                                    # 收集受影響的品項
+                                    affected_pids = set(l["product_id"] for l in logs)
 
-                                    if not other_sessions:
-                                        # 唯一的盤點 — 刪除後庫存需從進貨重算
-                                        all_tx = sb.table("transactions").select(
-                                            "product_id, change_qty"
-                                        ).eq("clinic_id", clinic_id).execute().data
-                                        tx_sum = defaultdict(int)
-                                        for t in all_tx:
-                                            tx_sum[int(t["product_id"])] += int(t["change_qty"])
-
-                                        # 所有品項庫存歸 0 + 進貨
-                                        all_cs = sb.table("clinic_stock").select(
-                                            "product_id"
-                                        ).eq("clinic_id", clinic_id).execute().data
-                                        for cs_item in all_cs:
-                                            pid = cs_item["product_id"]
-                                            sb.table("clinic_stock").update(
-                                                {"current_stock": tx_sum.get(pid, 0)}
-                                            ).eq("product_id", pid).eq("clinic_id", clinic_id).execute()
-                                    else:
-                                        # 有其他盤點 — 逐品項回退到前一次
-                                        affected_pids = set(l["product_id"] for l in logs)
-                                        for pid in affected_pids:
-                                            prev = sb.table("inventory_logs").select(
-                                                "current_count_qty, log_date"
-                                            ).eq("product_id", pid).eq(
-                                                "clinic_id", clinic_id
-                                            ).neq("session_id", s["id"]).order(
-                                                "log_date", desc=True
-                                            ).limit(1).execute().data
-
-                                            if prev:
-                                                prev_qty = int(prev[0]["current_count_qty"])
-                                                prev_date = prev[0]["log_date"]
-                                            else:
-                                                prev_qty = 0
-                                                prev_date = "1900-01-01"
-
-                                            tx_after = sb.table("transactions").select(
-                                                "change_qty"
-                                            ).eq("product_id", pid).eq(
-                                                "clinic_id", clinic_id
-                                            ).gt("tx_date", prev_date).execute().data
-                                            restock_total = sum(int(t["change_qty"]) for t in tx_after)
-
-                                            sb.table("clinic_stock").update(
-                                                {"current_stock": int(prev_qty + restock_total)}
-                                            ).eq("product_id", pid).eq("clinic_id", clinic_id).execute()
-
+                                    # 先刪除 logs 和 session
                                     sb.table("inventory_logs").delete().eq("session_id", s["id"]).execute()
                                     sb.table("inventory_sessions").delete().eq("id", s["id"]).execute()
+
+                                    # 再重算每個受影響品項的庫存
+                                    for pid in affected_pids:
+                                        recalc_stock(int(pid), int(clinic_id))
+
                                     st.success("已刪除整筆盤點")
                                     st.rerun()
                                 except Exception as e:
