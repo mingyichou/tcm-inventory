@@ -206,8 +206,8 @@ def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
     thin = Side(style="thin")
     double = Side(style="double")
     border_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
-    header_font = Font(bold=True, size=10)
-    data_font = Font(size=9)
+    header_font = Font(bold=True, size=11)
+    data_font = Font(size=11)
     center = Alignment(horizontal="center", vertical="center")
     left_align = Alignment(horizontal="left", vertical="center")
 
@@ -234,23 +234,22 @@ def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
             periods.append((h1, None, None, ""))
 
     # 組裝欄位：注音, 品項, 廠1, 廠2, [期間欄位...], 建議叫貨
+    # 欄寬配合 A4 直式（總寬約 85 單位）
     col_specs = []  # (header_name, df_col_or_None, width)
-    col_specs.append(("注音", None, 4))
-    col_specs.append(("品項", "品項", 16))
-    col_specs.append(("廠1", "廠牌1", 3))
-    col_specs.append(("廠2", "廠牌2", 3))
+    col_specs.append(("注音", None, 5))
+    col_specs.append(("品項", "品項", 22))
+    col_specs.append(("廠1", "廠牌1", 5))
+    col_specs.append(("廠2", "廠牌2", 5))
 
     for i, (h_inv, h_restock, h_consume, date_label) in enumerate(periods):
         if h_restock and h_consume:
-            # 有資料的期間：盤點日期 + 進貨 + 耗用
-            col_specs.append((date_label, h_inv, 6))
-            col_specs.append(("進貨", h_restock, 5))
-            col_specs.append(("耗用", h_consume, 5))
+            col_specs.append((date_label, h_inv, 8))
+            col_specs.append(("進貨", h_restock, 7))
+            col_specs.append(("耗用", h_consume, 7))
         else:
-            # 無資料的期間：只留 1 欄
-            col_specs.append((date_label or "", h_inv, 6))
+            col_specs.append((date_label or "", h_inv, 8))
 
-    col_specs.append(("建議叫貨", "建議叫貨", 6))
+    col_specs.append(("建議叫貨", "建議叫貨", 8))
 
     # 品項少的分類合併為一頁
     MERGE_CATS = {"水藥材", "高貴藥材", "非健保藥材"}
@@ -308,7 +307,7 @@ def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
     wb = Workbook()
     wb.remove(wb.active)
 
-    cat_title_font = Font(bold=True, size=11)
+    cat_title_font = Font(bold=True, size=12)
 
     # 分組：一般分類各自一頁，合併分類集中一頁
     grouped = df.groupby("分類", sort=False)
