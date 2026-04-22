@@ -1603,7 +1603,6 @@ def page_analytics():
             cab_products = cab_sb.table("products").select(
                 "id, name, category_id, categories(name), units(name)"
             ).execute().data
-            cab_products = sort_products_by_bopomofo(cab_products)
 
             cab_cs = cab_sb.table("clinic_stock").select(
                 "product_id, current_stock, cabinet, is_active, brand1_id, brand2_id"
@@ -1618,54 +1617,86 @@ def page_analytics():
                 cs = cab_cs_map.get(p["id"])
                 if not cs or not cs.get("is_active", True):
                     continue
+                cabinet_val = cs.get("cabinet") or ""
                 cab_rows.append({
-                    "櫃位": cs.get("cabinet") or "(未設定)",
+                    "櫃位": cabinet_val,
                     "品項": p["name"],
                     "分類": p["categories"]["name"],
                     "單位": p["units"]["name"],
-                    "廠牌1": cab_brand_map.get(cs.get("brand1_id"), "-"),
-                    "廠牌2": cab_brand_map.get(cs.get("brand2_id"), "-"),
-                    "即時庫存": int(cs["current_stock"]),
+                    "廠1": abbr_brand(cab_brand_map.get(cs.get("brand1_id"), "-")),
+                    "廠2": abbr_brand(cab_brand_map.get(cs.get("brand2_id"), "-")),
+                    "庫存": int(cs["current_stock"]),
                 })
 
             if cab_rows:
-                cab_df = pd.DataFrame(cab_rows).sort_values(["櫃位", "分類"]).reset_index(drop=True)
+                cab_df = pd.DataFrame(cab_rows)
+
+                # 選分類篩選
+                cab_cats = sorted(cab_df["分類"].unique())
+                cab_cat_filter = st.selectbox("分類", ["全部"] + list(cab_cats), key="cab_cat")
+                if cab_cat_filter != "全部":
+                    cab_df = cab_df[cab_df["分類"] == cab_cat_filter]
+
+                # 依櫃位排序
+                cab_df = cab_df.sort_values(["櫃位", "品項"]).reset_index(drop=True)
                 st.dataframe(style_banded(cab_df), use_container_width=True, hide_index=True)
 
                 # 匯出
                 if st.button("📥 匯出櫃位分類表", type="primary"):
-                    buf = io.BytesIO()
                     from openpyxl.styles import Font, Border, Side, Alignment
                     from openpyxl import Workbook
                     from openpyxl.utils import get_column_letter
 
                     thin_s = Side(style="thin")
+                    double_s = Side(style="double")
                     border_t = Border(left=thin_s, right=thin_s, top=thin_s, bottom=thin_s)
 
                     wb = Workbook()
-                    ws = wb.active
-                    ws.title = f"櫃位分類_{selected_clinic}"
-                    ws.page_setup.orientation = "portrait"
-                    ws.page_setup.paperSize = ws.PAPERSIZE_A4
-                    ws.page_setup.fitToWidth = 1
-                    ws.page_setup.fitToHeight = 0
-                    ws.sheet_properties.pageSetUpPr.fitToPage = True
+                    wb.remove(wb.active)
 
-                    headers = ["櫃位", "品項", "分類", "單位", "廠牌1", "廠牌2", "即時庫存"]
-                    widths = [6, 20, 12, 6, 8, 8, 8]
-                    for ci, (h, w) in enumerate(zip(headers, widths), 1):
-                        cell = ws.cell(row=1, column=ci, value=h)
-                        cell.font = Font(bold=True, size=11)
-                        cell.border = border_t
-                        cell.alignment = Alignment(horizontal="center")
-                        ws.column_dimensions[get_column_letter(ci)].width = w
+                    # 每分類一個 sheet，依櫃位排序
+                    full_df = pd.DataFrame(cab_rows)
+                    for cat_name, cat_group in full_df.groupby("分類", sort=True):
+                        ws = wb.create_sheet(title=str(cat_name)[:31])
+                        ws.page_setup.orientation = "portrait"
+                        ws.page_setup.paperSize = ws.PAPERSIZE_A4
+                        ws.page_setup.fitToWidth = 1
+                        ws.page_setup.fitToHeight = 0
+                        ws.sheet_properties.pageSetUpPr.fitToPage = True
 
-                    for ri, (_, row) in enumerate(cab_df.iterrows(), 2):
-                        for ci, h in enumerate(headers, 1):
-                            cell = ws.cell(row=ri, column=ci, value=row[h])
-                            cell.font = Font(size=11)
+                        headers = ["櫃位", "品項", "廠1", "廠2", "庫存"]
+                        widths = [6, 22, 5, 5, 7]
+                        for ci, (h, w) in enumerate(zip(headers, widths), 1):
+                            cell = ws.cell(row=1, column=ci, value=h)
+                            cell.font = Font(bold=True, size=11)
                             cell.border = border_t
+                            cell.alignment = Alignment(horizontal="center")
+                            ws.column_dimensions[get_column_letter(ci)].width = w
 
+                        sorted_group = cat_group.sort_values(["櫃位", "品項"]).reset_index(drop=True)
+                        prev_cab = None
+                        row_num = 2
+                        for _, r in sorted_group.iterrows():
+                            cur_cab = r["櫃位"]
+                            # 櫃位切換 → 上一行加雙線
+                            if prev_cab is not None and cur_cab != prev_cab and row_num > 2:
+                                for ci in range(1, len(headers) + 1):
+                                    cell = ws.cell(row=row_num - 1, column=ci)
+                                    cell.border = Border(left=thin_s, right=thin_s, top=thin_s, bottom=double_s)
+
+                            show_cab = cur_cab if cur_cab != prev_cab else ""
+                            prev_cab = cur_cab
+
+                            vals = [show_cab, r["品項"], r["廠1"], r["廠2"], r["庫存"]]
+                            for ci, v in enumerate(vals, 1):
+                                cell = ws.cell(row=row_num, column=ci, value=v)
+                                cell.font = Font(size=11)
+                                cell.border = border_t
+                                if ci != 2:
+                                    cell.alignment = Alignment(horizontal="center")
+                            row_num += 1
+
+                    buf = io.BytesIO()
                     wb.save(buf)
                     buf.seek(0)
                     st.download_button("📥 下載", data=buf.getvalue(),
