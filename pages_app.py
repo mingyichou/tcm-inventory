@@ -198,34 +198,63 @@ def abbr_brand(name):
 # ══════════════════════════════════════════════
 
 def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
-    """產生庫存表 Excel：每分類一頁，注音分組+雙線分隔，A4 直式"""
+    """產生庫存表 Excel：每分類一頁，注音分組+雙線分隔，全格線，A4 直式"""
     from openpyxl.styles import Font, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
-
-    # 簡化欄位標題
-    col_map = {h3: h3.replace("盤(", "").replace(")", ""),
-               hr32: "進貨", hc32: "耗用",
-               h2: h2.replace("盤(", "").replace(")", ""),
-               hr21: "進貨", hc21: "耗用",
-               h1: h1.replace("盤(", "").replace(")", "")}
-
-    # 要輸出的欄位（去掉進(迄今)、即時庫存、叫貨）
-    export_cols = ["品項", "廠牌1", "廠牌2",
-                   h3, hr32, hc32, h2, hr21, hc21, h1, "建議叫貨"]
-    # 過濾實際存在的欄位
-    export_cols = [c for c in export_cols if c in df.columns]
-
-    buf = io.BytesIO()
     from openpyxl import Workbook
-    wb = Workbook()
-    wb.remove(wb.active)
 
     thin = Side(style="thin")
     double = Side(style="double")
+    border_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
     header_font = Font(bold=True, size=10)
     data_font = Font(size=9)
     center = Alignment(horizontal="center", vertical="center")
-    left = Alignment(horizontal="left", vertical="center")
+    left_align = Alignment(horizontal="left", vertical="center")
+
+    # 判斷哪些期間有資料（有實際日期才展開 3 欄，否則只留 1 欄空白）
+    # d3 有日期 → 盤+進+耗; 沒有 → 只留 1 欄空白
+    periods = []
+    if h3 in df.columns:
+        has_d3 = not h3.startswith("盤(3)") and not h3.startswith("盤(-)")
+        if has_d3:
+            periods.append((h3, hr32, hc32, h3.replace("盤(", "").replace(")", "")))
+        else:
+            periods.append((h3, None, None, ""))
+    if h2 in df.columns:
+        has_d2 = not h2.startswith("盤(2)") and not h2.startswith("盤(-)")
+        if has_d2:
+            periods.append((h2, hr21, hc21, h2.replace("盤(", "").replace(")", "")))
+        else:
+            periods.append((h2, None, None, ""))
+    if h1 in df.columns:
+        has_d1 = not h1.startswith("盤(1)") and not h1.startswith("盤(-)")
+        if has_d1:
+            periods.append((h1, None, None, h1.replace("盤(", "").replace(")", "")))
+        else:
+            periods.append((h1, None, None, ""))
+
+    # 組裝欄位：注音, 品項, 廠1, 廠2, [期間欄位...], 建議叫貨
+    col_specs = []  # (header_name, df_col_or_None, width)
+    col_specs.append(("注音", None, 4))
+    col_specs.append(("品項", "品項", 16))
+    col_specs.append(("廠1", "廠牌1", 3))
+    col_specs.append(("廠2", "廠牌2", 3))
+
+    for i, (h_inv, h_restock, h_consume, date_label) in enumerate(periods):
+        if h_restock and h_consume:
+            # 有資料的期間：盤點日期 + 進貨 + 耗用
+            col_specs.append((date_label, h_inv, 6))
+            col_specs.append(("進貨", h_restock, 5))
+            col_specs.append(("耗用", h_consume, 5))
+        else:
+            # 無資料的期間：只留 1 欄
+            col_specs.append((date_label or "", h_inv, 6))
+
+    col_specs.append(("建議叫貨", "建議叫貨", 6))
+
+    buf = io.BytesIO()
+    wb = Workbook()
+    wb.remove(wb.active)
 
     for cat_name, cat_group in df.groupby("分類", sort=False):
         ws = wb.create_sheet(title=str(cat_name)[:31])
@@ -235,25 +264,15 @@ def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
         ws.page_setup.fitToHeight = 0
         ws.sheet_properties.pageSetUpPr.fitToPage = True
 
-        # 寫表頭
-        headers = ["注音", "品項", "廠1", "廠2"]
-        for c in export_cols:
-            if c in ("品項", "廠牌1", "廠牌2"):
-                continue
-            headers.append(col_map.get(c, c))
-
-        for ci, h in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=ci, value=h)
+        # 表頭
+        for ci, (header, _, width) in enumerate(col_specs, 1):
+            cell = ws.cell(row=1, column=ci, value=header)
             cell.font = header_font
             cell.alignment = center
-            cell.border = Border(bottom=thin)
+            cell.border = border_thin
+            ws.column_dimensions[get_column_letter(ci)].width = width
 
-        # 欄寬
-        col_widths = [4, 16, 3, 3] + [6] * (len(headers) - 4)
-        for ci, w in enumerate(col_widths, 1):
-            ws.column_dimensions[get_column_letter(ci)].width = w
-
-        # 寫資料
+        # 資料
         row_num = 2
         prev_initial = None
         cat_data = cat_group.reset_index(drop=True)
@@ -261,30 +280,34 @@ def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
         for _, r in cat_data.iterrows():
             initial = get_bopomofo_initial(r["品項"])
 
-            # 注音分組切換 → 加雙線
+            # 注音分組切換 → 上一行改雙線底邊
             if prev_initial is not None and initial != prev_initial:
-                # 在上一行加雙線底邊
-                for ci in range(1, len(headers) + 1):
+                for ci in range(1, len(col_specs) + 1):
                     cell = ws.cell(row=row_num - 1, column=ci)
-                    old = cell.border
-                    cell.border = Border(left=old.left, right=old.right,
-                                         top=old.top, bottom=double)
+                    cell.border = Border(left=thin, right=thin, top=thin, bottom=double)
 
-            # 注音欄：只在每組第一個顯示
             show_initial = initial if initial != prev_initial else ""
             prev_initial = initial
 
-            vals = [show_initial, r["品項"], abbr_brand(r["廠牌1"]), abbr_brand(r["廠牌2"])]
-            for c in export_cols:
-                if c in ("品項", "廠牌1", "廠牌2"):
-                    continue
-                v = r.get(c)
-                vals.append(int(v) if pd.notna(v) and v != "" else "")
+            for ci, (_, df_col, _) in enumerate(col_specs, 1):
+                if ci == 1:
+                    val = show_initial
+                elif df_col == "品項":
+                    val = r["品項"]
+                elif df_col == "廠牌1":
+                    val = abbr_brand(r["廠牌1"])
+                elif df_col == "廠牌2":
+                    val = abbr_brand(r["廠牌2"])
+                elif df_col and df_col in r.index:
+                    v = r[df_col]
+                    val = int(v) if pd.notna(v) and v != "" else ""
+                else:
+                    val = ""
 
-            for ci, v in enumerate(vals, 1):
-                cell = ws.cell(row=row_num, column=ci, value=v)
+                cell = ws.cell(row=row_num, column=ci, value=val)
                 cell.font = data_font
-                cell.alignment = center if ci != 2 else left
+                cell.alignment = left_align if df_col == "品項" else center
+                cell.border = border_thin
 
             row_num += 1
 
@@ -298,10 +321,13 @@ def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
 # ══════════════════════════════════════════════
 
 def _build_order_excel(order_data):
-    """產生叫貨單 Excel：單一 sheet，依廠牌分區，4 欄品項+數量"""
+    """產生叫貨單 Excel：單一 sheet，依廠牌分區，4 欄品項+數量，全格線"""
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
+
+    thin = Side(style="thin")
+    border_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     wb = Workbook()
     ws = wb.active
@@ -312,7 +338,6 @@ def _build_order_excel(order_data):
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
 
-    # 欄寬：品項|數量 x4
     for i in range(4):
         ws.column_dimensions[get_column_letter(i * 2 + 1)].width = 14
         ws.column_dimensions[get_column_letter(i * 2 + 2)].width = 5
@@ -321,7 +346,6 @@ def _build_order_excel(order_data):
     header_font = Font(bold=True, size=9)
     data_font = Font(size=9)
     center = Alignment(horizontal="center", vertical="center")
-    left = Alignment(horizontal="left", vertical="center")
 
     row_num = 1
 
@@ -329,29 +353,38 @@ def _build_order_excel(order_data):
         if not brand_name or brand_name == "-":
             brand_name = "未指定"
 
-        # 廠牌標題
         cell = ws.cell(row=row_num, column=1, value=brand_name)
         cell.font = brand_font
         row_num += 1
 
-        # 表頭
         for i in range(4):
-            ws.cell(row=row_num, column=i * 2 + 1, value="品項").font = header_font
-            ws.cell(row=row_num, column=i * 2 + 2, value="數量").font = header_font
+            c1 = ws.cell(row=row_num, column=i * 2 + 1, value="品項")
+            c1.font = header_font
+            c1.border = border_thin
+            c2 = ws.cell(row=row_num, column=i * 2 + 2, value="數量")
+            c2.font = header_font
+            c2.border = border_thin
+            c2.alignment = center
         row_num += 1
 
-        # 資料：4 欄排列
         items = list(group.itertuples(index=False))
         for chunk_start in range(0, len(items), 4):
             chunk = items[chunk_start:chunk_start + 4]
             for i, item in enumerate(chunk):
-                ws.cell(row=row_num, column=i * 2 + 1, value=item.品項).font = data_font
-                qty_cell = ws.cell(row=row_num, column=i * 2 + 2, value=int(item.叫貨數量))
-                qty_cell.font = data_font
-                qty_cell.alignment = center
+                c1 = ws.cell(row=row_num, column=i * 2 + 1, value=item.品項)
+                c1.font = data_font
+                c1.border = border_thin
+                c2 = ws.cell(row=row_num, column=i * 2 + 2, value=int(item.叫貨數量))
+                c2.font = data_font
+                c2.alignment = center
+                c2.border = border_thin
+            # 填滿空格的格線
+            for i in range(len(chunk), 4):
+                ws.cell(row=row_num, column=i * 2 + 1).border = border_thin
+                ws.cell(row=row_num, column=i * 2 + 2).border = border_thin
             row_num += 1
 
-        row_num += 1  # 廠牌間空一行
+        row_num += 1
 
     buf = io.BytesIO()
     wb.save(buf)
