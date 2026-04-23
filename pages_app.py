@@ -1906,8 +1906,16 @@ def page_items():
                             product_changes["spec_note"] = new["規格"] if new["規格"] != "-" else None
 
                         if product_changes:
-                            sb.table("products").update(product_changes).eq("id", pid).execute()
-                            updated += 1
+                            try:
+                                sb.table("products").update(product_changes).eq("id", pid).execute()
+                                updated += 1
+                            except Exception as e:
+                                err_msg = str(e)
+                                if "duplicate" in err_msg.lower() or "unique" in err_msg.lower():
+                                    st.error(f"品項「{new['品項名稱']}」名稱重複，無法更新")
+                                else:
+                                    st.error(f"更新「{old['品項名稱']}」失敗：{e}")
+                                continue
 
                         # per-clinic 欄位 → 更新 clinic_stock 表
                         cs_changes = {}
