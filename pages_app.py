@@ -305,6 +305,7 @@ def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
         ws.page_setup.fitToWidth = 1
         ws.page_setup.fitToHeight = 0
         ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.print_title_rows = "1:1"
 
     buf = io.BytesIO()
     wb = Workbook()
@@ -1015,6 +1016,8 @@ def page_inventory():
                 ws.page_setup.fitToWidth = 1
                 ws.page_setup.fitToHeight = 0
                 ws.sheet_properties.pageSetUpPr.fitToPage = True
+                # 每頁列印都重複第 1 行表頭
+                ws.print_title_rows = "1:1"
 
                 # 表頭
                 for ci, (h, w, _) in enumerate(pcols, 1):
@@ -1111,6 +1114,7 @@ def page_inventory():
                 ws.page_setup.fitToWidth = 1
                 ws.page_setup.fitToHeight = 0
                 ws.sheet_properties.pageSetUpPr.fitToPage = True
+                ws.print_title_rows = "1:1"
                 # 表頭
                 for ci, (h, w, _) in enumerate(pcols, 1):
                     cell = ws.cell(row=1, column=ci, value=h)
