@@ -112,9 +112,9 @@ def style_banded(df, highlight_col=None):
             hl = "background-color: #E8E0F0; font-weight: bold; border-left: 3px solid #6A5ACD"
             styles[col_idx] = hl + ("; " + border if border else "")
         return styles
-    # 數字欄位格式化為整數，None 顯示空白
+    # 數字欄位格式化為小數1位，None 顯示空白
     num_cols = df.select_dtypes(include=["number", "float", "int"]).columns.tolist()
-    fmt = {c: lambda v: "" if pd.isna(v) else f"{int(v)}" for c in num_cols}
+    fmt = {c: lambda v: "" if pd.isna(v) else f"{v:.1f}" for c in num_cols}
     return df.style.apply(row_style, axis=1).format(fmt)
 
 
@@ -163,7 +163,7 @@ def recalc_stock(product_id: int, clinic_id: int):
     ).order("log_date", desc=True).limit(1).execute().data
 
     if last_log:
-        base_qty = int(last_log[0]["current_count_qty"])
+        base_qty = float(last_log[0]["current_count_qty"])
         last_date = last_log[0]["log_date"]
     else:
         base_qty = 0
@@ -175,9 +175,9 @@ def recalc_stock(product_id: int, clinic_id: int):
     ).eq("product_id", product_id).eq(
         "clinic_id", clinic_id
     ).gt("tx_date", last_date).execute().data
-    restock = sum(int(t["change_qty"]) for t in tx_after)
+    restock = sum(float(t["change_qty"]) for t in tx_after)
 
-    new_stock = int(base_qty + restock)
+    new_stock = round(base_qty + restock, 1)
     sb.table("clinic_stock").update(
         {"current_stock": new_stock}
     ).eq("product_id", product_id).eq("clinic_id", clinic_id).execute()
@@ -281,7 +281,7 @@ def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
                     val = abbr_brand(r["廠牌2"])
                 elif df_col and df_col in r.index:
                     v = r[df_col]
-                    val = int(v) if pd.notna(v) and v != "" else ""
+                    val = round(float(v), 1) if pd.notna(v) and v != "" else ""
                 else:
                     val = ""
                 cell = ws.cell(row=row_num, column=ci, value=val)
@@ -410,7 +410,7 @@ def _build_order_excel(order_data):
                 c1 = ws.cell(row=row_num, column=i * 2 + 1, value=item.品項)
                 c1.font = data_font
                 c1.border = border_thin
-                c2 = ws.cell(row=row_num, column=i * 2 + 2, value=int(item.叫貨數量))
+                c2 = ws.cell(row=row_num, column=i * 2 + 2, value=round(float(item.叫貨數量), 1))
                 c2.font = data_font
                 c2.alignment = center
                 c2.border = border_thin
@@ -486,7 +486,7 @@ def page_stock_overview():
     consumed_by_product = defaultdict(list)
     for log in all_logs:
         if log["consumed_qty"] is not None and log["consumed_qty"] > 0:
-            consumed_by_product[log["product_id"]].append(int(log["consumed_qty"]))
+            consumed_by_product[log["product_id"]].append(float(log["consumed_qty"]))
 
     # 取得最近 3 個不重複的盤點日期
     seen_dates = []
@@ -558,22 +558,22 @@ def page_stock_overview():
 
         # 進貨 3→2
         if d3 and d2 and d3 != d2:
-            r32 = sum(int(t["change_qty"]) for t in tx_by_product.get(pid, []) if d3 < t["tx_date"] <= d2)
+            r32 = sum(float(t["change_qty"]) for t in tx_by_product.get(pid, []) if d3 < t["tx_date"] <= d2)
         else:
             r32 = None
         c32 = (v3 + r32 - v2) if (v3 is not None and v2 is not None and r32 is not None) else None
 
         # 進貨 2→1
         if d2 and d1 and d2 != d1:
-            r21 = sum(int(t["change_qty"]) for t in tx_by_product.get(pid, []) if d2 < t["tx_date"] <= d1)
+            r21 = sum(float(t["change_qty"]) for t in tx_by_product.get(pid, []) if d2 < t["tx_date"] <= d1)
         else:
             r21 = None
         c21 = (v2 + r21 - v1) if (v2 is not None and v1 is not None and r21 is not None) else None
 
         # 進貨迄今
-        r_now = sum(int(t["change_qty"]) for t in tx_by_product.get(pid, []) if t["tx_date"] > d1) if d1 else 0
+        r_now = sum(float(t["change_qty"]) for t in tx_by_product.get(pid, []) if t["tx_date"] > d1) if d1 else 0
 
-        current_stock = int(cs["current_stock"]) if cs else 0
+        current_stock = float(cs["current_stock"]) if cs else 0
 
         # 建議叫貨
         avg_vals = consumed_by_product.get(pid, [])
@@ -613,17 +613,17 @@ def page_stock_overview():
         "廠牌1": st.column_config.TextColumn(disabled=True),
         "櫃位": st.column_config.TextColumn(disabled=True),
         "廠牌2": st.column_config.TextColumn(disabled=True),
-        h3: st.column_config.NumberColumn(disabled=True, format="%d"),
-        hr32: st.column_config.NumberColumn(disabled=True, format="%d"),
-        hc32: st.column_config.NumberColumn(disabled=True, format="%d"),
-        h2: st.column_config.NumberColumn(disabled=True, format="%d"),
-        hr21: st.column_config.NumberColumn(disabled=True, format="%d"),
-        hc21: st.column_config.NumberColumn(disabled=True, format="%d"),
-        h1: st.column_config.NumberColumn(disabled=True, format="%d"),
-        "進(迄今)": st.column_config.NumberColumn(disabled=True, format="%d"),
-        "即時庫存": st.column_config.NumberColumn(disabled=True, format="%d"),
-        "建議叫貨": st.column_config.NumberColumn(disabled=True, format="%d"),
-        "叫貨": st.column_config.NumberColumn("叫貨 ✏️", min_value=0, format="%d"),
+        h3: st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        hr32: st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        hc32: st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        h2: st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        hr21: st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        hc21: st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        h1: st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        "進(迄今)": st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        "即時庫存": st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        "建議叫貨": st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        "叫貨": st.column_config.NumberColumn("叫貨 ✏️", min_value=0, format="%.1f"),
     }
 
     edited_stock_df = st.data_editor(
@@ -686,7 +686,7 @@ def page_stock_overview():
             selected_fix = st.selectbox("選擇要修正的盤點紀錄", list(fix_options.keys()), key="fix_log")
             fix_log = fix_options[selected_fix]
 
-            new_qty = st.number_input("修正後數量", value=int(fix_log["current_count_qty"]), step=1, key="fix_qty")
+            new_qty = st.number_input("修正後數量", value=float(fix_log["current_count_qty"]), step=0.1, format="%.1f", key="fix_qty")
 
             if st.button("改錯存檔", type="primary"):
                 try:
@@ -737,7 +737,7 @@ def page_transactions():
         cs_map = {s["product_id"]: s for s in cs_data}
         products = [p for p in products if cs_map.get(p["id"], {}).get("is_active", True)]
 
-        stock_map = {s["product_id"]: int(s["current_stock"]) for s in cs_data}
+        stock_map = {s["product_id"]: float(s["current_stock"]) for s in cs_data}
 
         categories = load_categories()
         col_filter, col_search = st.columns([1, 2])
@@ -771,7 +771,7 @@ def page_transactions():
             with col1:
                 tx_type = st.selectbox("異動類型", ["進貨", "調撥", "廢棄"])
             with col2:
-                qty = st.number_input("數量（負數=調出/廢棄）", value=0, step=1)
+                qty = st.number_input("數量（負數=調出/廢棄）", value=0.0, step=0.1, format="%.1f")
             with col3:
                 tx_date = st.date_input("日期", value=date.today())
 
@@ -796,7 +796,7 @@ def page_transactions():
                         }).execute()
 
                         new_stock = recalc_stock(product["id"], clinic_id)
-                        st.success(f"已登錄：{product['name']} {qty:+d}（即時庫存：{new_stock}）")
+                        st.success(f"已登錄：{product['name']} {qty:+.1f}（即時庫存：{new_stock}）")
                     except Exception as e:
                         st.error(f"登錄失敗：{e}")
 
@@ -827,7 +827,7 @@ def page_transactions():
         else:
             hist_rows = [{
                 "日期": t["tx_date"], "品項": t["products"]["name"], "類型": t["tx_type"],
-                "數量": int(t["change_qty"]), "單位": t["products"]["units"]["name"],
+                "數量": float(t["change_qty"]), "單位": t["products"]["units"]["name"],
                 "備註": t["note"] or "", "操作人": t["users"]["display_name"] if t.get("users") else "-",
             } for t in resp.data]
 
@@ -845,7 +845,7 @@ def page_transactions():
             st.subheader("修改或刪除紀錄")
 
             tx_options = {
-                f"#{t['id']} | {t['tx_date']} | {t['products']['name']} | {int(t['change_qty']):+d}": t
+                f"#{t['id']} | {t['tx_date']} | {t['products']['name']} | {float(t['change_qty']):+.1f}": t
                 for t in resp.data
             }
             selected_tx_key = st.selectbox("選擇紀錄", list(tx_options.keys()), key="tx_hist_select")
@@ -853,7 +853,7 @@ def page_transactions():
 
             col_a, col_b, col_c = st.columns(3)
             with col_a:
-                edit_qty = st.number_input("數量", value=int(tx_item["change_qty"]), step=1, key="tx_edit_qty")
+                edit_qty = st.number_input("數量", value=float(tx_item["change_qty"]), step=0.1, format="%.1f", key="tx_edit_qty")
             with col_b:
                 type_list = ["進貨", "調撥", "廢棄"]
                 edit_type = st.selectbox("類型", type_list,
@@ -909,56 +909,267 @@ def page_inventory():
 
     tab_do, tab_print, tab_history = st.tabs(["📝 執行盤點", "🖨️ 列印盤點表", "📜 盤點歷史"])
 
-    # ── 列印盤點表 ──
+    # ── 列印盤點表（含歷史資料）──
     with tab_print:
-        st.subheader("🖨️ 列印空白盤點表")
-        st.caption("下載 Excel，列印後拿紙本到藥櫃盤點，再回來建檔")
+        st.subheader("🖨️ 列印盤點表")
+        st.caption("含歷史盤點/進貨/耗用，最右欄為新盤點數量填寫欄")
 
         print_cat = st.selectbox("分類", ["全部"] + [c["name"] for c in load_categories()], key="print_cat")
 
-        products = sb.table("products").select(
-            "name, category_id, categories(name), units(name)"
-        ).execute().data
-        products = sort_products_by_bopomofo(products)
-
-        # per-clinic 啟用
-        cs_print = sb.table("clinic_stock").select("product_id, is_active, cabinet").eq("clinic_id", clinic_id).execute().data
-        active_set = {s["product_id"] for s in cs_print if s.get("is_active", True)}
-        cab_map = {s["product_id"]: s.get("cabinet") or "" for s in cs_print}
-
-        products_with_id = sb.table("products").select(
+        # 載入品項 + per-clinic 資料
+        all_prods = sb.table("products").select(
             "id, name, category_id, categories(name), units(name)"
         ).execute().data
-        products_with_id = sort_products_by_bopomofo(products_with_id)
-        products_with_id = [p for p in products_with_id if p["id"] in active_set]
+        all_prods = sort_products_by_bopomofo(all_prods)
 
+        cs_print = sb.table("clinic_stock").select(
+            "product_id, current_stock, is_active, cabinet, brand1_id, brand2_id"
+        ).eq("clinic_id", clinic_id).execute().data
+        cs_print_map = {s["product_id"]: s for s in cs_print}
+
+        brands_data = load_brands()
+        brand_map_print = {b["id"]: b["name"] for b in brands_data}
+
+        # 載入歷史盤點
+        print_logs = sb.table("inventory_logs").select(
+            "product_id, current_count_qty, log_date"
+        ).eq("clinic_id", clinic_id).order("log_date", desc=True).execute().data
+
+        # 最近 3 個盤點日期
+        p_dates = []
+        for lg in print_logs:
+            if lg["log_date"] not in p_dates:
+                p_dates.append(lg["log_date"])
+            if len(p_dates) >= 3:
+                break
+        p_display = list(reversed(p_dates))  # 最舊→最新
+
+        # 每品項盤點
+        p_log_map = defaultdict(dict)
+        for lg in print_logs:
+            pid = lg["product_id"]
+            d = lg["log_date"]
+            if d not in p_log_map[pid]:
+                p_log_map[pid][d] = lg
+
+        # 進退貨
+        print_tx = sb.table("transactions").select(
+            "product_id, change_qty, tx_date"
+        ).eq("clinic_id", clinic_id).execute().data
+        tx_by_p = defaultdict(list)
+        for tx in print_tx:
+            tx_by_p[tx["product_id"]].append(tx)
+
+        active_prods = [p for p in all_prods
+                        if cs_print_map.get(p["id"], {}).get("is_active", True)]
         if print_cat != "全部":
-            products_with_id = [p for p in products_with_id if p["categories"]["name"] == print_cat]
+            active_prods = [p for p in active_prods if p["categories"]["name"] == print_cat]
 
-        print_rows = [{"品項名稱": p["name"], "櫃位": cab_map.get(p["id"], ""),
-                       "分類": p["categories"]["name"],
-                       "單位": p["units"]["name"], "盤點數量": ""} for p in products_with_id]
+        if active_prods:
+            # 用 _build_stock_excel 的邏輯產生 Excel
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
 
-        if print_rows:
-            print_df = pd.DataFrame(print_rows)
+            thin = Side(style="thin")
+            double = Side(style="double")
+            border_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
+            hdr_font = Font(bold=True, size=10)
+            dat_font = Font(size=10)
+            ctr = Alignment(horizontal="center", vertical="center")
+            lft = Alignment(horizontal="left", vertical="center")
+
+            # 組欄位
+            pcols = []  # (header, width, data_key_or_None)
+            pcols.append(("注音", 4, "_initial"))
+            pcols.append(("品項", 16, "_name"))
+            pcols.append(("櫃", 4, "_cabinet"))
+            pcols.append(("廠1", 3, "_b1"))
+            pcols.append(("廠2", 3, "_b2"))
+
+            for i, d in enumerate(p_display):
+                sd = short_date(d)
+                pcols.append((sd, 5, f"_inv_{d}"))
+                if i < len(p_display) - 1:
+                    pcols.append(("進貨", 5, f"_restock_{d}"))
+                    pcols.append(("耗用", 5, f"_consume_{d}"))
+                else:
+                    # 最新盤點後也加進貨+耗用（新生成）
+                    pcols.append(("進貨", 5, f"_restock_{d}"))
+                    pcols.append(("耗用", 5, f"_consume_{d}"))
+
+            pcols.append(("日期:      ", 10, "_new"))  # 新盤點欄，2倍寬
 
             buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                print_df.to_excel(writer, index=False, sheet_name="盤點表")
-                ws = writer.sheets["盤點表"]
-                ws.column_dimensions["A"].width = 30
-                ws.column_dimensions["B"].width = 15
-                ws.column_dimensions["C"].width = 8
-                ws.column_dimensions["D"].width = 12
+            wb = Workbook()
+            wb.remove(wb.active)
+
+            MERGE_CATS = {"水藥材", "高貴藥材", "非健保藥材"}
+            cat_groups = defaultdict(list)
+            for p in active_prods:
+                cat_groups[p["categories"]["name"]].append(p)
+
+            def write_print_sheet(ws, prods_list, sheet_title=None):
+                ws.page_setup.orientation = "portrait"
+                ws.page_setup.paperSize = ws.PAPERSIZE_A4
+                ws.page_setup.fitToWidth = 1
+                ws.page_setup.fitToHeight = 0
+                ws.sheet_properties.pageSetUpPr.fitToPage = True
+
+                # 表頭
+                for ci, (h, w, _) in enumerate(pcols, 1):
+                    cell = ws.cell(row=1, column=ci, value=h)
+                    cell.font = hdr_font
+                    cell.alignment = ctr
+                    cell.border = border_thin
+                    ws.column_dimensions[get_column_letter(ci)].width = w
+
+                row_num = 2
+                prev_initial = None
+                for p in prods_list:
+                    pid = p["id"]
+                    cs = cs_print_map.get(pid, {})
+                    initial = get_bopomofo_initial(p["name"])
+
+                    if prev_initial is not None and initial != prev_initial:
+                        for ci in range(1, len(pcols) + 1):
+                            cell = ws.cell(row=row_num - 1, column=ci)
+                            cell.border = Border(left=thin, right=thin, top=thin, bottom=double)
+
+                    show_init = initial if initial != prev_initial else ""
+                    prev_initial = initial
+
+                    p_logs_data = p_log_map.get(pid, {})
+
+                    for ci, (_, _, key) in enumerate(pcols, 1):
+                        if key == "_initial":
+                            val = show_init
+                        elif key == "_name":
+                            val = p["name"]
+                        elif key == "_cabinet":
+                            val = cs.get("cabinet") or ""
+                        elif key == "_b1":
+                            val = abbr_brand(brand_map_print.get(cs.get("brand1_id"), "-"))
+                        elif key == "_b2":
+                            val = abbr_brand(brand_map_print.get(cs.get("brand2_id"), "-"))
+                        elif key and key.startswith("_inv_"):
+                            d = key[5:]
+                            lg = p_logs_data.get(d)
+                            val = round(float(lg["current_count_qty"]), 1) if lg else ""
+                        elif key and key.startswith("_restock_"):
+                            d = key[9:]
+                            idx = p_display.index(d) if d in p_display else -1
+                            if idx < len(p_display) - 1:
+                                next_d = p_display[idx + 1]
+                                val = round(sum(float(t["change_qty"]) for t in tx_by_p.get(pid, [])
+                                                if d < t["tx_date"] <= next_d), 1)
+                            else:
+                                # 最新盤點後到今天
+                                val = round(sum(float(t["change_qty"]) for t in tx_by_p.get(pid, [])
+                                                if t["tx_date"] > d), 1)
+                        elif key and key.startswith("_consume_"):
+                            d = key[9:]
+                            idx = p_display.index(d) if d in p_display else -1
+                            lg_this = p_logs_data.get(d)
+                            if idx < len(p_display) - 1:
+                                next_d = p_display[idx + 1]
+                                lg_next = p_logs_data.get(next_d)
+                                restock = sum(float(t["change_qty"]) for t in tx_by_p.get(pid, [])
+                                              if d < t["tx_date"] <= next_d)
+                                if lg_this and lg_next:
+                                    val = round(float(lg_this["current_count_qty"]) + restock - float(lg_next["current_count_qty"]), 1)
+                                else:
+                                    val = ""
+                            else:
+                                val = ""  # 最新盤點的耗用待新盤點才知道
+                        elif key == "_new":
+                            val = ""  # 空白待填
+                        else:
+                            val = ""
+
+                        cell = ws.cell(row=row_num, column=ci, value=val)
+                        cell.font = dat_font
+                        cell.alignment = lft if key == "_name" else ctr
+                        cell.border = border_thin
+                    row_num += 1
+                return row_num
+
+            # 正常分類各自一頁
+            merge_prods = []
+            for cat_name, prods in cat_groups.items():
+                if cat_name in MERGE_CATS:
+                    merge_prods.append((cat_name, prods))
+                else:
+                    ws = wb.create_sheet(title=str(cat_name)[:31])
+                    write_print_sheet(ws, prods)
+
+            # 合併小分類
+            if merge_prods:
+                ws = wb.create_sheet(title="其他藥材")
+                ws.page_setup.orientation = "portrait"
+                ws.page_setup.paperSize = ws.PAPERSIZE_A4
+                ws.page_setup.fitToWidth = 1
+                ws.page_setup.fitToHeight = 0
+                ws.sheet_properties.pageSetUpPr.fitToPage = True
+                # 表頭
+                for ci, (h, w, _) in enumerate(pcols, 1):
+                    cell = ws.cell(row=1, column=ci, value=h)
+                    cell.font = hdr_font
+                    cell.alignment = ctr
+                    cell.border = border_thin
+                    ws.column_dimensions[get_column_letter(ci)].width = w
+                row_num = 2
+                cat_title_f = Font(bold=True, size=11)
+                for idx_m, (cat_name, prods) in enumerate(merge_prods):
+                    cell = ws.cell(row=row_num, column=1, value=f"【{cat_name}】")
+                    cell.font = cat_title_f
+                    ws.merge_cells(start_row=row_num, start_column=1,
+                                   end_row=row_num, end_column=len(pcols))
+                    row_num += 1
+                    prev_initial = None
+                    for p in prods:
+                        pid = p["id"]
+                        cs = cs_print_map.get(pid, {})
+                        initial = get_bopomofo_initial(p["name"])
+                        if prev_initial is not None and initial != prev_initial:
+                            for ci in range(1, len(pcols) + 1):
+                                cell = ws.cell(row=row_num - 1, column=ci)
+                                cell.border = Border(left=thin, right=thin, top=thin, bottom=double)
+                        show_init = initial if initial != prev_initial else ""
+                        prev_initial = initial
+                        p_logs_data = p_log_map.get(pid, {})
+                        for ci, (_, _, key) in enumerate(pcols, 1):
+                            if key == "_initial": val = show_init
+                            elif key == "_name": val = p["name"]
+                            elif key == "_cabinet": val = cs.get("cabinet") or ""
+                            elif key == "_b1": val = abbr_brand(brand_map_print.get(cs.get("brand1_id"), "-"))
+                            elif key == "_b2": val = abbr_brand(brand_map_print.get(cs.get("brand2_id"), "-"))
+                            elif key and key.startswith("_inv_"):
+                                d = key[5:]
+                                lg = p_logs_data.get(d)
+                                val = round(float(lg["current_count_qty"]), 1) if lg else ""
+                            elif key and key.startswith("_restock_") or key and key.startswith("_consume_") or key == "_new":
+                                val = ""
+                            else:
+                                val = ""
+                            cell = ws.cell(row=row_num, column=ci, value=val)
+                            cell.font = dat_font
+                            cell.alignment = lft if key == "_name" else ctr
+                            cell.border = border_thin
+                        row_num += 1
+                    if idx_m < len(merge_prods) - 1:
+                        row_num += 2
+
+            wb.save(buf)
+            buf.seek(0)
 
             st.download_button(
-                f"📥 下載盤點表（{len(print_df)} 品項）",
+                f"📥 下載盤點表（{len(active_prods)} 品項）",
                 data=buf.getvalue(),
                 file_name=f"盤點表_{selected_clinic}_{date.today()}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True, type="primary",
             )
-            st.dataframe(style_banded(print_df), use_container_width=True, hide_index=True, height=300)
 
     # ── 執行盤點 ──
     with tab_do:
@@ -993,7 +1204,7 @@ def page_inventory():
             cs_map = {s["product_id"]: s for s in cs_data}
             products = [p for p in products if cs_map.get(p["id"], {}).get("is_active", True)]
 
-            stock_map = {s["product_id"]: int(s["current_stock"]) for s in cs_data}
+            stock_map = {s["product_id"]: float(s["current_stock"]) for s in cs_data}
 
             filtered = products
             if cat_filter != "全部":
@@ -1017,8 +1228,8 @@ def page_inventory():
                         "品項名稱": st.column_config.TextColumn(disabled=True),
                         "分類": st.column_config.TextColumn(disabled=True),
                         "單位": st.column_config.TextColumn(disabled=True),
-                        "帳面庫存": st.column_config.NumberColumn(disabled=True, format="%d"),
-                        "盤點數量": st.column_config.NumberColumn("盤點數量 ✏️", min_value=0, format="%d"),
+                        "帳面庫存": st.column_config.NumberColumn(disabled=True, format="%.1f"),
+                        "盤點數量": st.column_config.NumberColumn("盤點數量 ✏️", min_value=0, format="%.1f"),
                     },
                     height=min(len(df) * 35 + 38, 600),
                     key="inv_editor",
@@ -1047,7 +1258,7 @@ def page_inventory():
                             for log in last_logs:
                                 pid = log["product_id"]
                                 if pid not in last_count_map:
-                                    last_count_map[pid] = int(log["current_count_qty"])
+                                    last_count_map[pid] = float(log["current_count_qty"])
                                     last_date_map[pid] = log["log_date"]
 
                             all_tx = sb.table("transactions").select(
@@ -1074,10 +1285,10 @@ def page_inventory():
                                 last_dt = last_date_map.get(product_id, "1900-01-01")
 
                                 restock_sum = int(sum(
-                                    int(t["change_qty"]) for t in tx_by_pid.get(product_id, [])
+                                    float(t["change_qty"]) for t in tx_by_pid.get(product_id, [])
                                     if last_dt < t["tx_date"] <= str(inv_date)
                                 ))
-                                consumed = int(last_qty + restock_sum - count_qty)
+                                consumed = round(last_qty + restock_sum - count_qty, 1)
 
                                 logs_to_insert.append({
                                     "session_id": int(session_id), "product_id": product_id,
@@ -1128,7 +1339,7 @@ def page_inventory():
                 "product_id, current_stock, is_active"
             ).eq("clinic_id", clinic_id).execute().data
             active_pids = {s["product_id"] for s in cs_active if s.get("is_active", True)}
-            stock_map_hist = {s["product_id"]: int(s["current_stock"]) for s in cs_active}
+            stock_map_hist = {s["product_id"]: float(s["current_stock"]) for s in cs_active}
             all_products = [p for p in all_products if p["id"] in active_pids]
 
             for s in sessions:
@@ -1157,7 +1368,7 @@ def page_inventory():
                                 "分類": "",
                                 "單位": p["units"]["name"],
                                 "帳面庫存": stock_map_hist.get(pid, 0),
-                                "盤點數量": int(log["current_count_qty"]) if log["current_count_qty"] is not None else None,
+                                "盤點數量": float(log["current_count_qty"]) if log["current_count_qty"] is not None else None,
                             })
                             row_meta.append((pid, log["id"]))
                         else:
@@ -1179,8 +1390,8 @@ def page_inventory():
                             "品項": st.column_config.TextColumn(disabled=True),
                             "分類": st.column_config.TextColumn(disabled=True),
                             "單位": st.column_config.TextColumn(disabled=True),
-                            "帳面庫存": st.column_config.NumberColumn(disabled=True, format="%d"),
-                            "盤點數量": st.column_config.NumberColumn("盤點數量 ✏️", min_value=0, format="%d"),
+                            "帳面庫存": st.column_config.NumberColumn(disabled=True, format="%.1f"),
+                            "盤點數量": st.column_config.NumberColumn("盤點數量 ✏️", min_value=0, format="%.1f"),
                         },
                         height=min(len(log_df) * 35 + 38, 600),
                         key=f"hist_editor_{s['id']}",
@@ -1208,7 +1419,7 @@ def page_inventory():
                             for pl in prev_logs:
                                 pid = pl["product_id"]
                                 if pid not in prev_map:
-                                    prev_map[pid] = int(pl["current_count_qty"])
+                                    prev_map[pid] = float(pl["current_count_qty"])
                                     prev_date_map[pid] = pl["log_date"]
 
                             updated, inserted = 0, 0
@@ -1226,7 +1437,7 @@ def page_inventory():
                                 last_qty = prev_map.get(pid, stock_map_hist.get(pid, 0))
                                 last_dt = prev_date_map.get(pid, "1900-01-01")
                                 restock_sum = int(sum(
-                                    int(t["change_qty"]) for t in tx_by_pid.get(pid, [])
+                                    float(t["change_qty"]) for t in tx_by_pid.get(pid, [])
                                     if last_dt < t["tx_date"] <= s["session_date"]
                                 ))
                                 consumed = int(last_qty + restock_sum - new_qty)
@@ -1531,7 +1742,7 @@ def page_analytics():
     for log in all_logs:
         pid = log["product_id"]
         if log["consumed_qty"] is not None and log["consumed_qty"] > 0:
-            product_consumed[pid].append(int(log["consumed_qty"]))
+            product_consumed[pid].append(float(log["consumed_qty"]))
         product_info[pid] = {
             "name": log["products"]["name"],
             "category": log["products"]["categories"]["name"],
@@ -1550,7 +1761,7 @@ def page_analytics():
             resp = sb.table("clinic_stock").select("product_id, current_stock, clinic_id").eq("clinic_id", cid).execute()
             stock_data.extend(resp.data)
 
-        stock_map = {(s["product_id"], s["clinic_id"]): int(s["current_stock"]) for s in stock_data}
+        stock_map = {(s["product_id"], s["clinic_id"]): float(s["current_stock"]) for s in stock_data}
 
         reorder_rows = []
         for pid, consumed_list in product_consumed.items():
@@ -1625,7 +1836,7 @@ def page_analytics():
                     "單位": p["units"]["name"],
                     "廠1": abbr_brand(cab_brand_map.get(cs.get("brand1_id"), "-")),
                     "廠2": abbr_brand(cab_brand_map.get(cs.get("brand2_id"), "-")),
-                    "庫存": int(cs["current_stock"]),
+                    "庫存": float(cs["current_stock"]),
                 })
 
             if cab_rows:
@@ -1748,7 +1959,7 @@ def page_order():
     consumed_data = defaultdict(list)
     for l in logs:
         if l["consumed_qty"] and l["consumed_qty"] > 0:
-            consumed_data[l["product_id"]].append(int(l["consumed_qty"]))
+            consumed_data[l["product_id"]].append(float(l["consumed_qty"]))
 
     st.subheader("步驟一：編輯叫貨清單")
     show_all = st.checkbox("顯示所有品項", value=False)
@@ -1759,7 +1970,7 @@ def page_order():
         if not cs or not cs.get("is_active", True):
             continue
 
-        current = int(cs["current_stock"])
+        current = float(cs["current_stock"])
         vals = consumed_data.get(p["id"], [])
         avg = sum(vals) / len(vals) if vals else 0
         auto = current < avg * safety and avg > 0
@@ -1787,9 +1998,9 @@ def page_order():
             "品項": st.column_config.TextColumn(disabled=True),
             "分類": st.column_config.TextColumn(disabled=True),
             "單位": st.column_config.TextColumn(disabled=True),
-            "目前庫存": st.column_config.NumberColumn(disabled=True, format="%d"),
-            "建議數量": st.column_config.NumberColumn(disabled=True, format="%d"),
-            "叫貨數量": st.column_config.NumberColumn("數量 ✏️", min_value=0, format="%d"),
+            "目前庫存": st.column_config.NumberColumn(disabled=True, format="%.1f"),
+            "建議數量": st.column_config.NumberColumn(disabled=True, format="%.1f"),
+            "叫貨數量": st.column_config.NumberColumn("數量 ✏️", min_value=0, format="%.1f"),
             "廠牌": st.column_config.SelectboxColumn(options=brand_names),
         },
         height=min(len(display) * 35 + 38, 500), key="order_editor",
@@ -1812,7 +2023,7 @@ def page_order():
         edited_brand = st.data_editor(bdf, use_container_width=True, hide_index=True,
                                        column_config={"品項": st.column_config.TextColumn(disabled=True),
                                                       "單位": st.column_config.TextColumn(disabled=True),
-                                                      "叫貨數量": st.column_config.NumberColumn(format="%d")},
+                                                      "叫貨數量": st.column_config.NumberColumn(format="%.1f")},
                                        key=f"brand_{brand_name}")
         brand_dfs[brand_name] = edited_brand
         st.caption(f"{len(edited_brand)} 品項")
