@@ -1192,9 +1192,15 @@ def page_inventory():
             st.error("最多上傳 20 張照片")
             uploaded_files = uploaded_files[:20]
 
+        # 初始化 session_state
+        if "photo_results" not in st.session_state:
+            st.session_state.photo_results = None
+
+        # 步驟 1：辨識
         if uploaded_files and st.button("🔍 開始辨識", type="primary", key="photo_recognize"):
             try:
                 from google import genai
+                import json as json_mod
                 client = genai.Client(api_key=st.secrets["gemini"]["api_key"])
 
                 PROMPT = """【任務目標】
@@ -1217,73 +1223,45 @@ def page_inventory():
 
                 all_items = []
                 detected_dates = []
-
                 progress = st.progress(0, text="辨識中...")
 
                 for i, f in enumerate(uploaded_files):
-                    progress.progress((i + 1) / len(uploaded_files), text=f"辨識第 {i+1}/{len(uploaded_files)} 張...")
-
+                    progress.progress((i + 1) / len(uploaded_files),
+                                      text=f"辨識第 {i+1}/{len(uploaded_files)} 張...")
                     img_bytes = f.read()
-
                     response = client.models.generate_content(
                         model="gemini-2.5-flash",
                         contents=[
-                            genai.types.Part.from_bytes(data=img_bytes, mime_type=f.type or "image/jpeg"),
+                            genai.types.Part.from_bytes(
+                                data=img_bytes, mime_type=f.type or "image/jpeg"),
                             PROMPT,
                         ],
                     )
-
-                    # 解析 JSON
                     text = response.text.strip()
                     if text.startswith("```"):
                         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-
-                    import json
-                    result = json.loads(text)
-
+                    result = json_mod.loads(text)
                     if result.get("date"):
                         detected_dates.append(result["date"])
-
                     for item in result.get("items", []):
                         if item.get("name"):
                             all_items.append(item)
 
                 progress.empty()
-                st.success(f"辨識完成！共 {len(uploaded_files)} 張照片，{len(all_items)} 筆資料")
 
-                # 日期處理
+                # 日期解析
                 unique_dates = list(set(d for d in detected_dates if d))
-                final_date = str(photo_date)
+                parsed_ai_dates = set()
+                for d in unique_dates:
+                    try:
+                        parts = d.replace(".", "/").replace("-", "/").split("/")
+                        m, dy = int(parts[0]), int(parts[1])
+                        y = date.today().year
+                        parsed_ai_dates.add(date(y, m, dy).isoformat())
+                    except Exception:
+                        pass
 
-                if unique_dates:
-                    # 嘗試解析 AI 辨識的日期
-                    parsed_ai_dates = set()
-                    for d in unique_dates:
-                        try:
-                            parts = d.replace(".", "/").replace("-", "/").split("/")
-                            m, dy = int(parts[0]), int(parts[1])
-                            y = date.today().year
-                            parsed_ai_dates.add(date(y, m, dy).isoformat())
-                        except Exception:
-                            pass
-
-                    if len(parsed_ai_dates) == 1:
-                        ai_date = list(parsed_ai_dates)[0]
-                        if ai_date != str(photo_date):
-                            st.warning(f"照片上的日期是 **{ai_date}**，但您選的是 **{photo_date}**")
-                            date_choice = st.radio("使用哪個日期？",
-                                [f"照片日期 ({ai_date})", f"手選日期 ({photo_date})"],
-                                key="date_choice")
-                            if "照片" in date_choice:
-                                final_date = ai_date
-                        else:
-                            final_date = ai_date
-                    elif len(parsed_ai_dates) > 1:
-                        st.warning(f"多張照片辨識到不同日期：{', '.join(parsed_ai_dates)}")
-                        final_date = st.selectbox("請選擇正確日期",
-                            [str(photo_date)] + sorted(parsed_ai_dates), key="multi_date")
-                else:
-                    st.info(f"照片未辨識到日期，將使用您選擇的 {photo_date}")
+                ai_date = list(parsed_ai_dates)[0] if len(parsed_ai_dates) == 1 else None
 
                 # 品名匹配
                 all_products_db = sb.table("products").select("id, name").execute().data
@@ -1291,30 +1269,26 @@ def page_inventory():
                 for p in all_products_db:
                     name_to_pid[p["name"]] = p["id"]
                     name_to_pid[p["name"].strip()] = p["id"]
-                    # 也加入去掉空白的版本
                     name_to_pid[p["name"].replace(" ", "")] = p["id"]
 
-                # per-clinic 啟用
                 cs_photo = sb.table("clinic_stock").select(
                     "product_id, current_stock, is_active"
                 ).eq("clinic_id", clinic_id).execute().data
                 active_pids = {s["product_id"] for s in cs_photo if s.get("is_active", True)}
                 stock_map_photo = {s["product_id"]: float(s["current_stock"]) for s in cs_photo}
 
-                # 去重：同品名取最後一筆
+                # 去重
                 item_map = {}
                 for item in all_items:
                     name = item["name"].strip()
                     item_map[name] = item.get("qty")
 
-                # 匹配結果
-                matched = []
-                unmatched = []
+                matched, unmatched = [], []
                 for name, qty in item_map.items():
                     pid = name_to_pid.get(name) or name_to_pid.get(name.replace(" ", ""))
                     if pid and pid in active_pids:
                         matched.append({
-                            "product_id": pid,
+                            "product_id": int(pid),
                             "品項": next(p["name"] for p in all_products_db if p["id"] == pid),
                             "辨識數量": round(float(qty), 1) if qty is not None else None,
                             "帳面庫存": stock_map_photo.get(pid, 0),
@@ -1322,36 +1296,78 @@ def page_inventory():
                     else:
                         unmatched.append({"品項(未匹配)": name, "辨識數量": qty})
 
-                st.markdown(f"**匹配成功 {len(matched)} 筆** / 未匹配 {len(unmatched)} 筆")
+                # 存入 session_state
+                st.session_state.photo_results = {
+                    "matched": matched,
+                    "unmatched": unmatched,
+                    "ai_date": ai_date,
+                    "parsed_ai_dates": sorted(parsed_ai_dates) if parsed_ai_dates else [],
+                    "photo_count": len(uploaded_files),
+                    "item_count": len(all_items),
+                }
+                st.rerun()
 
-                if unmatched:
-                    with st.expander(f"⚠️ {len(unmatched)} 筆未匹配（可忽略或手動處理）"):
-                        st.dataframe(pd.DataFrame(unmatched), use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.error(f"辨識失敗：{e}")
+                import traceback
+                st.code(traceback.format_exc())
 
-                if matched:
-                    match_df = pd.DataFrame(matched)
+        # 步驟 2：顯示辨識結果（從 session_state 讀取）
+        results = st.session_state.get("photo_results")
+        if results:
+            matched = results["matched"]
+            unmatched = results["unmatched"]
+            ai_date = results["ai_date"]
 
-                    # 預覽可修改
-                    st.subheader(f"📋 預覽辨識結果（日期：{final_date}）")
-                    edited_match = st.data_editor(
-                        match_df[["品項", "帳面庫存", "辨識數量"]],
-                        use_container_width=True, hide_index=True,
-                        column_config={
-                            "品項": st.column_config.TextColumn(disabled=True),
-                            "帳面庫存": st.column_config.NumberColumn(disabled=True, format="%.1f"),
-                            "辨識數量": st.column_config.NumberColumn("盤點數量 ✏️", min_value=0, format="%.1f"),
-                        },
-                        height=min(len(match_df) * 35 + 38, 500),
-                        key="photo_result_editor",
-                    )
+            st.success(f"辨識完成！{results['photo_count']} 張照片，{results['item_count']} 筆資料")
 
-                    # 確認存檔
-                    filled_count = edited_match["辨識數量"].notna().sum()
-                    st.caption(f"有效數量 {filled_count} / {len(edited_match)}")
+            # 日期處理
+            if ai_date and ai_date != str(photo_date):
+                st.warning(f"照片日期 **{ai_date}** 與選擇日期 **{photo_date}** 不同")
+                date_choice = st.radio("使用哪個日期？",
+                    [f"照片日期 ({ai_date})", f"手選日期 ({photo_date})"],
+                    key="photo_date_choice")
+                final_date = ai_date if "照片" in date_choice else str(photo_date)
+            elif ai_date:
+                final_date = ai_date
+                st.info(f"照片辨識日期：{ai_date}")
+            elif results["parsed_ai_dates"] and len(results["parsed_ai_dates"]) > 1:
+                st.warning(f"多張照片辨識到不同日期")
+                final_date = st.selectbox("請選擇正確日期",
+                    [str(photo_date)] + results["parsed_ai_dates"], key="photo_multi_date")
+            else:
+                final_date = str(photo_date)
+                st.info(f"使用選擇日期：{photo_date}")
 
+            st.markdown(f"**匹配成功 {len(matched)} 筆** / 未匹配 {len(unmatched)} 筆")
+
+            if unmatched:
+                with st.expander(f"⚠️ {len(unmatched)} 筆未匹配"):
+                    st.dataframe(pd.DataFrame(unmatched), use_container_width=True, hide_index=True)
+
+            if matched:
+                match_df = pd.DataFrame(matched)
+
+                st.subheader(f"📋 預覽辨識結果（日期：{final_date}）")
+                edited_match = st.data_editor(
+                    match_df[["品項", "帳面庫存", "辨識數量"]],
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "品項": st.column_config.TextColumn(disabled=True),
+                        "帳面庫存": st.column_config.NumberColumn(disabled=True, format="%.1f"),
+                        "辨識數量": st.column_config.NumberColumn("盤點數量 ✏️", min_value=0, format="%.1f"),
+                    },
+                    height=min(len(match_df) * 35 + 38, 500),
+                    key="photo_result_editor",
+                )
+
+                filled_count = edited_match["辨識數量"].notna().sum()
+                st.caption(f"有效數量 {filled_count} / {len(edited_match)}")
+
+                col_save, col_clear = st.columns([3, 1])
+                with col_save:
                     if st.button("✅ 確認存檔盤點", type="primary", key="photo_save",
                                  disabled=(filled_count == 0)):
-                        # 收集資料
                         entries = []
                         for idx, row in edited_match.iterrows():
                             if pd.notna(row["辨識數量"]):
@@ -1361,7 +1377,6 @@ def page_inventory():
                         if not entries:
                             st.error("沒有有效的盤點數量")
                         else:
-                            # 檢查重複日期
                             dup_check = sb.table("inventory_sessions").select("id").eq(
                                 "clinic_id", clinic_id).eq("session_date", final_date).execute().data
                             has_dup = False
@@ -1376,7 +1391,6 @@ def page_inventory():
                                 st.warning(f"⚠️ {final_date} 已有盤點紀錄，請至「盤點歷史」修改。")
                             else:
                                 try:
-                                    # 取上次盤點資料
                                     last_logs = sb.table("inventory_logs").select(
                                         "product_id, current_count_qty, log_date"
                                     ).eq("clinic_id", clinic_id).order(
@@ -1395,7 +1409,6 @@ def page_inventory():
                                     for tx in all_tx:
                                         tx_by_pid[tx["product_id"]].append(tx)
 
-                                    # 建立 session
                                     session_resp = sb.table("inventory_sessions").insert({
                                         "clinic_id": int(clinic_id),
                                         "session_date": final_date,
@@ -1410,13 +1423,11 @@ def page_inventory():
                                         last_qty = last_count_map.get(product_id,
                                             stock_map_photo.get(product_id, 0))
                                         last_dt = last_date_map.get(product_id, "1900-01-01")
-
                                         restock_sum = round(sum(
                                             float(t["change_qty"]) for t in tx_by_pid.get(product_id, [])
                                             if last_dt < t["tx_date"] <= final_date
                                         ), 1)
                                         consumed = round(last_qty + restock_sum - count_qty, 1)
-
                                         logs_to_insert.append({
                                             "session_id": int(session_id),
                                             "product_id": int(product_id),
@@ -1429,20 +1440,20 @@ def page_inventory():
                                         })
 
                                     sb.table("inventory_logs").insert(logs_to_insert).execute()
-
                                     for entry in logs_to_insert:
                                         recalc_stock(entry["product_id"], int(clinic_id))
 
+                                    st.session_state.photo_results = None
                                     st.success(f"照片盤點完成！{len(logs_to_insert)} 個品項（日期：{final_date}）")
                                     st.balloons()
 
                                 except Exception as e:
                                     st.error(f"存檔失敗：{e}")
 
-            except Exception as e:
-                st.error(f"辨識失敗：{e}")
-                import traceback
-                st.code(traceback.format_exc())
+                with col_clear:
+                    if st.button("🗑️ 清除結果", key="photo_clear"):
+                        st.session_state.photo_results = None
+                        st.rerun()
 
     # ── 執行盤點 ──
     with tab_do:
