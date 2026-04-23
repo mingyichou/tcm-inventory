@@ -1391,6 +1391,12 @@ def page_inventory():
                                 st.warning(f"⚠️ {final_date} 已有盤點紀錄，請至「盤點歷史」修改。")
                             else:
                                 try:
+                                    # 重新查詢（避免 rerun 後變數消失）
+                                    cs_save = sb.table("clinic_stock").select(
+                                        "product_id, current_stock"
+                                    ).eq("clinic_id", clinic_id).execute().data
+                                    stock_map_save = {s["product_id"]: float(s["current_stock"]) for s in cs_save}
+
                                     last_logs = sb.table("inventory_logs").select(
                                         "product_id, current_count_qty, log_date"
                                     ).eq("clinic_id", clinic_id).order(
@@ -1421,7 +1427,7 @@ def page_inventory():
                                     logs_to_insert = []
                                     for product_id, count_qty in entries:
                                         last_qty = last_count_map.get(product_id,
-                                            stock_map_photo.get(product_id, 0))
+                                            stock_map_save.get(product_id, 0))
                                         last_dt = last_date_map.get(product_id, "1900-01-01")
                                         restock_sum = round(sum(
                                             float(t["change_qty"]) for t in tx_by_pid.get(product_id, [])
