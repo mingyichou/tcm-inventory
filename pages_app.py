@@ -553,9 +553,9 @@ def page_stock_overview():
         log2 = p_logs.get(d2) if d2 else None
         log1 = p_logs.get(d1) if d1 else None
 
-        v3 = int(log3["current_count_qty"]) if log3 else None
-        v2 = int(log2["current_count_qty"]) if log2 else None
-        v1 = int(log1["current_count_qty"]) if log1 else None
+        v3 = round(float(log3["current_count_qty"]), 1) if log3 else None
+        v2 = round(float(log2["current_count_qty"]), 1) if log2 else None
+        v1 = round(float(log1["current_count_qty"]), 1) if log1 else None
 
         # 進貨 3→2
         if d3 and d2 and d3 != d2:
@@ -580,7 +580,7 @@ def page_stock_overview():
         avg_vals = consumed_by_product.get(pid, [])
         avg_c = sum(avg_vals) / len(avg_vals) if avg_vals else 0
         if avg_c > 0 and current_stock <= avg_c * safety_factor:
-            suggested = max(0, round(avg_c * stock_multiplier - current_stock))
+            suggested = max(0, round(avg_c * stock_multiplier - current_stock, 1))
         else:
             suggested = 0
 
@@ -683,7 +683,7 @@ def page_stock_overview():
         if not fix_logs:
             st.info("該品項尚無盤點紀錄")
         else:
-            fix_options = {f"{l['log_date']} — 數量: {int(l['current_count_qty'])}": l for l in fix_logs}
+            fix_options = {f"{l['log_date']} — 數量: {round(float(l['current_count_qty']), 1)}": l for l in fix_logs}
             selected_fix = st.selectbox("選擇要修正的盤點紀錄", list(fix_options.keys()), key="fix_log")
             fix_log = fix_options[selected_fix]
 
@@ -1212,6 +1212,7 @@ def page_inventory():
 3. 擷取「日期:」下方每個品項對應的手寫盤點數量。
 4. 數字配對規則：
    - 「3+7」等加法請加總（=10）
+   - 含小數點的數字照實輸出，如「0.5」→ 0.5、「1.7」→ 1.7
    - 空白、斜線「/」、撇號「-」= null
    - 「K」或「k」= null
    - 有刪除線再重寫的，以最後寫的為準
@@ -1219,7 +1220,7 @@ def page_inventory():
 
 【輸出格式】
 嚴格 JSON，不要任何解釋文字：
-{"date": "4/8", "items": [{"name": "加味逍遙散", "qty": 15}, {"name": "葛根湯", "qty": null}]}"""
+{"date": "4/8", "items": [{"name": "加味逍遙散", "qty": 15}, {"name": "附子", "qty": 0.5}, {"name": "葛根湯", "qty": null}]}"""
 
                 all_items = []
                 detected_dates = []
@@ -1533,7 +1534,7 @@ def page_inventory():
                     entries = []
                     for idx, row in edited_df.iterrows():
                         if pd.notna(row["盤點數量"]):
-                            entries.append((idx, int(row["盤點數量"])))
+                            entries.append((idx, round(float(row["盤點數量"]), 1)))
 
                     if not entries:
                         st.error("沒有填入任何盤點數量，請重新填寫後再送出。")
@@ -1571,13 +1572,13 @@ def page_inventory():
 
                             for idx, count_qty in entries:
                                 product_id = int(df.iloc[idx]["product_id"])
-                                last_qty = int(last_count_map.get(product_id, stock_map.get(product_id, 0)))
+                                last_qty = round(float(last_count_map.get(product_id, stock_map.get(product_id, 0))), 1)
                                 last_dt = last_date_map.get(product_id, "1900-01-01")
 
-                                restock_sum = int(sum(
+                                restock_sum = round(sum(
                                     float(t["change_qty"]) for t in tx_by_pid.get(product_id, [])
                                     if last_dt < t["tx_date"] <= str(inv_date)
-                                ))
+                                ), 1)
                                 consumed = round(last_qty + restock_sum - count_qty, 1)
 
                                 logs_to_insert.append({
@@ -1721,20 +1722,20 @@ def page_inventory():
                                 if pd.isna(new_val):
                                     continue
 
-                                new_qty = int(new_val)
+                                new_qty = round(float(new_val), 1)
 
                                 # 計算耗用
-                                last_qty = prev_map.get(pid, stock_map_hist.get(pid, 0))
+                                last_qty = round(float(prev_map.get(pid, stock_map_hist.get(pid, 0))), 1)
                                 last_dt = prev_date_map.get(pid, "1900-01-01")
-                                restock_sum = int(sum(
+                                restock_sum = round(sum(
                                     float(t["change_qty"]) for t in tx_by_pid.get(pid, [])
                                     if last_dt < t["tx_date"] <= s["session_date"]
-                                ))
-                                consumed = int(last_qty + restock_sum - new_qty)
+                                ), 1)
+                                consumed = round(last_qty + restock_sum - new_qty, 1)
 
                                 if log_id is not None:
                                     # 已有 log — 更新
-                                    if pd.notna(old_val) and int(old_val) == new_qty:
+                                    if pd.notna(old_val) and round(float(old_val), 1) == new_qty:
                                         continue
                                     sb.table("inventory_logs").update({
                                         "current_count_qty": new_qty,
@@ -1747,7 +1748,7 @@ def page_inventory():
                                         "session_id": int(s["id"]),
                                         "product_id": int(pid),
                                         "clinic_id": int(clinic_id),
-                                        "last_count_qty": int(last_qty),
+                                        "last_count_qty": last_qty,
                                         "restock_qty_since_last": restock_sum,
                                         "current_count_qty": new_qty,
                                         "consumed_qty": consumed,
@@ -2073,8 +2074,8 @@ def page_analytics():
                     reorder_rows.append({
                         "診所": "澤豐" if cid == 1 else "澤沛",
                         "品項": info["name"], "分類": info["category"],
-                        "目前庫存": current, "平均耗用": round(avg),
-                        "建議叫貨": max(0, round(avg * multiplier - current)),
+                        "目前庫存": current, "平均耗用": round(avg, 1),
+                        "建議叫貨": max(0, round(avg * multiplier - current, 1)),
                     })
 
         if reorder_rows:
@@ -2096,7 +2097,7 @@ def page_analytics():
             total = sum(consumed_list)
             if total > 0:
                 ranking.append({"品項": info["name"], "分類": info["category"],
-                                "總耗用量": total, "平均耗用": round(total / len(consumed_list))})
+                                "總耗用量": round(total, 1), "平均耗用": round(total / len(consumed_list), 1)})
 
         if ranking:
             rank_df = pd.DataFrame(ranking).sort_values("總耗用量", ascending=False).reset_index(drop=True)
@@ -2272,7 +2273,7 @@ def page_order():
         vals = consumed_data.get(p["id"], [])
         avg = sum(vals) / len(vals) if vals else 0
         auto = current < avg * safety and avg > 0
-        suggested = max(0, round(avg * multiplier - current)) if auto else 0
+        suggested = max(0, round(avg * multiplier - current, 1)) if auto else 0
 
         order_rows.append({
             "勾選": auto, "品項": p["name"], "分類": p["categories"]["name"],
