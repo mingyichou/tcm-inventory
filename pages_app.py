@@ -47,11 +47,21 @@ def get_bopomofo_sort_key(name: str) -> str:
     return "".join(result)
 
 
-def sort_products_by_bopomofo(products: list) -> list:
-    return sorted(products, key=lambda p: (
-        p.get("category_id", 0),
-        get_bopomofo_sort_key(p["name"])
-    ))
+def sort_products_by_bopomofo(products: list, cs_map: dict | None = None) -> list:
+    """排序：分類 → 首字注音 → 櫃位（cs_map 提供時，無櫃位排到後面）→ 全字注音。
+    cs_map: {product_id: {"cabinet": "C1" 或 None}}。不傳則跳過櫃位排序層（澤豐情境）。"""
+    def sort_key(p):
+        cat_id = p.get("category_id", 0)
+        first_bpmf = get_bopomofo_initial(p["name"])
+        full_bpmf = get_bopomofo_sort_key(p["name"])
+        if cs_map is not None:
+            cs = cs_map.get(p["id"], {}) or {}
+            cabinet = (cs.get("cabinet") or "").strip()
+            # 沒櫃位的排在同首字組的最後
+            cabinet_key = cabinet if cabinet else "￿"
+            return (cat_id, first_bpmf, cabinet_key, full_bpmf)
+        return (cat_id, first_bpmf, full_bpmf)
+    return sorted(products, key=sort_key)
 
 
 @st.cache_data(ttl=300)
@@ -592,17 +602,17 @@ def page_stock_overview():
     with col2:
         search = st.text_input("搜尋", placeholder="中文 或 注音首碼（ee=葛根, 2e=當歸）", key="stock_search")
 
-    # 載入品項
-    products = sb.table("products").select(
-        "id, name, category_id, categories(name), units(name)"
-    ).execute().data
-    products = sort_products_by_bopomofo(products)
-
-    # 載入 per-clinic 資料
+    # 載入 per-clinic 資料（先載入以便排序時用櫃位）
     cs_data = sb.table("clinic_stock").select(
         "product_id, current_stock, brand1_id, brand2_id, is_active, cabinet"
     ).eq("clinic_id", clinic_id).execute().data
     cs_map = {s["product_id"]: s for s in cs_data}
+
+    # 載入品項並依（分類→首字注音→櫃位→全字注音）排序
+    products = sb.table("products").select(
+        "id, name, category_id, categories(name), units(name)"
+    ).execute().data
+    products = sort_products_by_bopomofo(products, cs_map=cs_map)
 
     # 搜尋索引
     all_names = tuple(p["name"] for p in products)
@@ -860,16 +870,16 @@ def page_transactions():
 
     with tab_add:
         sb = get_supabase_client()
+        # 先載 per-clinic 含 cabinet（排序用）
+        cs_data = sb.table("clinic_stock").select(
+            "product_id, current_stock, is_active, cabinet"
+        ).eq("clinic_id", clinic_id).execute().data
+        cs_map = {s["product_id"]: s for s in cs_data}
+
         products = sb.table("products").select(
             "id, name, category_id, categories(name), units(name)"
         ).execute().data
-        products = sort_products_by_bopomofo(products)
-
-        # per-clinic 啟用篩選
-        cs_data = sb.table("clinic_stock").select(
-            "product_id, current_stock, is_active"
-        ).eq("clinic_id", clinic_id).execute().data
-        cs_map = {s["product_id"]: s for s in cs_data}
+        products = sort_products_by_bopomofo(products, cs_map=cs_map)
         products = [p for p in products if cs_map.get(p["id"], {}).get("is_active", True)]
 
         stock_map = {s["product_id"]: float(s["current_stock"]) for s in cs_data}
@@ -901,49 +911,59 @@ def page_transactions():
         current_stock = stock_map.get(product["id"], 0)
         st.metric(f"📍 {selected_clinic} 目前庫存", f"{current_stock} {product['units']['name']}")
 
-        with st.form("tx_form"):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                tx_type = st.selectbox("異動類型", ["進貨", "調撥", "廢棄"])
-            with col2:
-                qty = st.number_input("數量（負數=調出/廢棄）", value=0.0, step=0.1, format="%.1f")
-            with col3:
-                tx_date = st.date_input("日期", value=date.today())
+        # 不用 st.form：避免 Enter 誤觸送出，必須點按鈕才會登錄
+        st.caption("💡 填完後請**點下方「確認登錄」按鈕**，按 Enter 不會送出")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            tx_type = st.selectbox("異動類型", ["進貨", "調撥", "廢棄"], key="tx_type_input")
+        with col2:
+            qty = st.number_input("數量（負數=調出/廢棄）", value=0.0, step=0.1, format="%.1f", key="tx_qty_input")
+        with col3:
+            tx_date = st.date_input("日期", value=date.today(), key="tx_date_input")
 
-            col4, col5 = st.columns(2)
-            with col4:
-                tx_brands = load_brands()
-                tx_brand_options = ["-"] + [b["name"] for b in tx_brands]
-                tx_brand = st.selectbox("廠牌", tx_brand_options, key="tx_brand")
-            with col5:
-                note = st.text_input("備註（選填）")
+        col4, col5 = st.columns(2)
+        with col4:
+            tx_brands = load_brands()
+            tx_brand_options = ["-"] + [b["name"] for b in tx_brands]
+            tx_brand = st.selectbox("廠牌", tx_brand_options, key="tx_brand")
+        with col5:
+            note = st.text_input("備註（選填）", key="tx_note_input")
 
-            if st.form_submit_button("確認登錄", type="primary", use_container_width=True):
-                if qty == 0:
-                    st.error("數量不可為 0")
-                else:
-                    try:
-                        full_note = f"[{tx_brand}] {note}".strip() if tx_brand != "-" else (note or None)
-                        sb.table("transactions").insert({
-                            "product_id": product["id"], "clinic_id": clinic_id,
-                            "change_qty": qty, "tx_date": str(tx_date),
-                            "tx_type": tx_type, "note": full_note, "created_by": user["id"],
-                        }).execute()
+        if st.button("✅ 確認登錄", type="primary", use_container_width=True, key="tx_submit_btn"):
+            if qty == 0:
+                st.error("數量不可為 0")
+            else:
+                try:
+                    full_note = f"[{tx_brand}] {note}".strip() if tx_brand != "-" else (note or None)
+                    # 同日同品項重複偵測（提示但不阻擋）
+                    dup_resp = sb.table("transactions").select("id").eq(
+                        "product_id", product["id"]).eq(
+                        "clinic_id", clinic_id).eq(
+                        "tx_date", str(tx_date)).execute().data
+                    sb.table("transactions").insert({
+                        "product_id": product["id"], "clinic_id": clinic_id,
+                        "change_qty": qty, "tx_date": str(tx_date),
+                        "tx_type": tx_type, "note": full_note, "created_by": user["id"],
+                    }).execute()
 
-                        recalc_consumed_for_product(int(product["id"]), int(clinic_id))
-                        new_stock = sb.table("clinic_stock").select("current_stock").eq(
-                            "product_id", product["id"]).eq("clinic_id", clinic_id).execute().data[0]["current_stock"]
-                        st.success(f"已登錄：{product['name']} {qty:+.1f}（即時庫存：{new_stock}）")
-                    except Exception as e:
-                        st.error(f"登錄失敗：{e}")
+                    recalc_consumed_for_product(int(product["id"]), int(clinic_id))
+                    new_stock = sb.table("clinic_stock").select("current_stock").eq(
+                        "product_id", product["id"]).eq("clinic_id", clinic_id).execute().data[0]["current_stock"]
+                    st.success(f"已登錄：{product['name']} {qty:+.1f}（即時庫存：{new_stock}）")
+                    if dup_resp:
+                        st.warning(f"⚠️ 注意：今天 {tx_date} 此品項已有 {len(dup_resp)} 筆紀錄。請確認是否重複登錄，可至「歷史紀錄」修改/刪除。")
+                except Exception as e:
+                    st.error(f"登錄失敗：{e}")
 
     with tab_history:
         sb = get_supabase_client()
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns([2, 2, 3])
         with col1:
             days_filter = st.selectbox("時間範圍", ["最近 30 天", "最近 7 天", "最近 90 天", "全部"], key="tx_days")
         with col2:
             type_filter = st.selectbox("類型", ["全部", "進貨", "調撥", "廢棄"], key="tx_type_filter")
+        with col3:
+            name_search = st.text_input("🔍 搜尋品項", placeholder="輸入品項名稱（可注音首碼，如 ee=葛根）", key="tx_hist_search")
 
         query = sb.table("transactions").select(
             "id, product_id, change_qty, tx_date, tx_type, note, "
@@ -957,16 +977,56 @@ def page_transactions():
         if type_filter != "全部":
             query = query.eq("tx_type", type_filter)
 
-        resp = query.limit(200).execute()
+        resp = query.limit(500).execute()
 
-        if not resp.data:
-            st.info("沒有異動紀錄")
+        # 品項名稱搜尋（含注音首碼）
+        filtered_resp = resp.data
+        if name_search and resp.data:
+            unique_names = tuple({t["products"]["name"] for t in resp.data})
+            name_idx = build_bopomofo_index(unique_names)
+            filtered_resp = [
+                t for t in resp.data
+                if match_search(t["products"]["name"], name_idx.get(t["products"]["name"], ("", "")), name_search)
+            ]
+
+        # 重複進貨偵測（同診所、同品項、同日期 ≥ 2 筆）
+        with st.expander("⚠️ 重複進貨偵測（同日期同品項 ≥ 2 筆）"):
+            st.caption(f"範圍：{selected_clinic} 的所有 transactions（不受上方時間/類型/搜尋篩選影響）")
+            all_tx_for_dup = sb.table("transactions").select(
+                "id, tx_date, change_qty, tx_type, note, product_id, products(name)"
+            ).eq("clinic_id", clinic_id).order("tx_date", desc=True).execute().data
+            dup_groups = defaultdict(list)
+            for t in all_tx_for_dup:
+                dup_groups[(t["tx_date"], t["product_id"])].append(t)
+            dup_rows = []
+            for (d, pid), items in dup_groups.items():
+                if len(items) >= 2:
+                    for t in items:
+                        dup_rows.append({
+                            "id": t["id"],
+                            "日期": t["tx_date"],
+                            "品項": t["products"]["name"],
+                            "類型": t["tx_type"],
+                            "數量": float(t["change_qty"]),
+                            "備註": t["note"] or "",
+                        })
+            if dup_rows:
+                dup_df = pd.DataFrame(dup_rows).sort_values(["日期", "品項", "id"]).reset_index(drop=True)
+                st.dataframe(style_banded(dup_df, bold_cols=["數量"]),
+                             use_container_width=True, hide_index=True)
+                st.caption(f"共 {len(dup_rows)} 筆涉及 {len({(r['日期'], r['品項']) for r in dup_rows})} 組重複，請以 id 在下方表格找到後修改/刪除")
+            else:
+                st.success("沒有重複進貨")
+
+        if not filtered_resp:
+            st.info("沒有符合條件的異動紀錄")
         else:
             hist_rows = [{
+                "id": t["id"],
                 "日期": t["tx_date"], "品項": t["products"]["name"], "類型": t["tx_type"],
                 "數量": float(t["change_qty"]), "單位": t["products"]["units"]["name"],
                 "備註": t["note"] or "", "操作人": t["users"]["display_name"] if t.get("users") else "-",
-            } for t in resp.data]
+            } for t in filtered_resp]
 
             hist_df = pd.DataFrame(hist_rows)
             styled = style_banded(hist_df, bold_cols=["數量"])
@@ -975,17 +1035,35 @@ def page_transactions():
                     "color:#28A745;font-weight:bold" if isinstance(v, (int, float)) and v > 0 else ""),
                 subset=["數量"],
             )
-            st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
+            st.caption(f"共 {len(hist_rows)} 筆 — 點選表格中的列即可在下方編輯")
+            event = st.dataframe(
+                styled, use_container_width=True, hide_index=True, height=400,
+                on_select="rerun", selection_mode="single-row", key="tx_hist_table",
+            )
 
-            # 修改/刪除
+            # 修改/刪除（自動帶入點選列）
             st.divider()
             st.subheader("修改或刪除紀錄")
 
             tx_options = {
                 f"#{t['id']} | {t['tx_date']} | {t['products']['name']} | {float(t['change_qty']):+.1f}": t
-                for t in resp.data
+                for t in filtered_resp
             }
-            selected_tx_key = st.selectbox("選擇紀錄", list(tx_options.keys()), key="tx_hist_select")
+            options_keys = list(tx_options.keys())
+
+            # 預設選擇：表格選取列；無選取則用 selectbox 第一個
+            selected_idx = 0
+            if event.selection.rows:
+                selected_idx = event.selection.rows[0]
+                if selected_idx >= len(options_keys):
+                    selected_idx = 0
+
+            selected_tx_key = st.selectbox(
+                "選擇紀錄（點上方表格自動選取）",
+                options_keys,
+                index=selected_idx,
+                key="tx_hist_select",
+            )
             tx_item = tx_options[selected_tx_key]
 
             col_a, col_b, col_c = st.columns(3)
@@ -1053,16 +1131,17 @@ def page_inventory():
 
         print_cat = st.selectbox("分類", ["全部"] + [c["name"] for c in load_categories()], key="print_cat")
 
-        # 載入品項 + per-clinic 資料
-        all_prods = sb.table("products").select(
-            "id, name, category_id, categories(name), units(name)"
-        ).execute().data
-        all_prods = sort_products_by_bopomofo(all_prods)
-
+        # 載入 per-clinic 資料（先載以供排序）
         cs_print = sb.table("clinic_stock").select(
             "product_id, current_stock, is_active, cabinet, brand1_id, brand2_id"
         ).eq("clinic_id", clinic_id).execute().data
         cs_print_map = {s["product_id"]: s for s in cs_print}
+
+        # 載入品項並排序
+        all_prods = sb.table("products").select(
+            "id, name, category_id, categories(name), units(name)"
+        ).execute().data
+        all_prods = sort_products_by_bopomofo(all_prods, cs_map=cs_print_map)
 
         brands_data = load_brands()
         brand_map_print = {b["id"]: b["name"] for b in brands_data}
@@ -1619,16 +1698,16 @@ def page_inventory():
             categories = load_categories()
             cat_filter = st.selectbox("分類（建議逐分類盤點）", ["全部"] + [c["name"] for c in categories], key="inv_cat")
 
+            # per-clinic 啟用篩選（含 cabinet 用於排序）
+            cs_data = sb.table("clinic_stock").select(
+                "product_id, current_stock, is_active, cabinet"
+            ).eq("clinic_id", clinic_id).execute().data
+            cs_map = {s["product_id"]: s for s in cs_data}
+
             products = sb.table("products").select(
                 "id, name, category_id, categories(name), units(name)"
             ).execute().data
-            products = sort_products_by_bopomofo(products)
-
-            # per-clinic 啟用篩選
-            cs_data = sb.table("clinic_stock").select(
-                "product_id, current_stock, is_active"
-            ).eq("clinic_id", clinic_id).execute().data
-            cs_map = {s["product_id"]: s for s in cs_data}
+            products = sort_products_by_bopomofo(products, cs_map=cs_map)
             products = [p for p in products if cs_map.get(p["id"], {}).get("is_active", True)]
 
             stock_map = {s["product_id"]: float(s["current_stock"]) for s in cs_data}
@@ -1755,18 +1834,19 @@ def page_inventory():
         if not sessions:
             st.info("尚無盤點紀錄")
         else:
+            # per-clinic 啟用（含 cabinet 用於排序）
+            cs_active = sb.table("clinic_stock").select(
+                "product_id, current_stock, is_active, cabinet"
+            ).eq("clinic_id", clinic_id).execute().data
+            active_pids = {s["product_id"] for s in cs_active if s.get("is_active", True)}
+            stock_map_hist = {s["product_id"]: float(s["current_stock"]) for s in cs_active}
+            cs_active_map = {s["product_id"]: s for s in cs_active}
+
             # 載入全品項（用於顯示完整清單）
             all_products = sb.table("products").select(
                 "id, name, category_id, units(name)"
             ).execute().data
-            all_products = sort_products_by_bopomofo(all_products)
-
-            # per-clinic 啟用
-            cs_active = sb.table("clinic_stock").select(
-                "product_id, current_stock, is_active"
-            ).eq("clinic_id", clinic_id).execute().data
-            active_pids = {s["product_id"] for s in cs_active if s.get("is_active", True)}
-            stock_map_hist = {s["product_id"]: float(s["current_stock"]) for s in cs_active}
+            all_products = sort_products_by_bopomofo(all_products, cs_map=cs_active_map)
             all_products = [p for p in all_products if p["id"] in active_pids]
 
             for s in sessions:
@@ -1945,7 +2025,6 @@ def page_items():
         st.error("找不到該診所")
         return
 
-    products = load_products()
     brands = load_brands()
     categories = load_categories()
     units = load_units()
@@ -1960,6 +2039,9 @@ def page_items():
         "product_id, brand1_id, brand2_id, is_active, cabinet"
     ).eq("clinic_id", clinic_id).execute().data
     cs_map = {s["product_id"]: s for s in cs_data}
+
+    # 依（分類 → 首字注音 → 櫃位 → 全字注音）排序
+    products = sort_products_by_bopomofo(load_products(), cs_map=cs_map)
 
     tab_list, tab_add = st.tabs(["📊 品項清單", "➕ 新增品項"])
 
@@ -2466,20 +2548,20 @@ def page_order():
     safety = float(next(s["value"] for s in settings if s["key"] == "safety_factor"))
     multiplier = float(next(s["value"] for s in settings if s["key"] == "stock_target_multiplier"))
 
-    products = sb.table("products").select(
-        "id, name, category_id, categories(name), units(name)"
-    ).execute().data
-    products = sort_products_by_bopomofo(products)
-
     brands = load_brands()
     brand_map = {b["id"]: b["name"] for b in brands}
     brand_names = [b["name"] for b in brands]
 
-    # per-clinic 資料
+    # per-clinic 資料（先載入以排序）
     cs_data = sb.table("clinic_stock").select(
-        "product_id, current_stock, brand1_id, is_active"
+        "product_id, current_stock, brand1_id, is_active, cabinet"
     ).eq("clinic_id", clinic_id).execute().data
     cs_map = {s["product_id"]: s for s in cs_data}
+
+    products = sb.table("products").select(
+        "id, name, category_id, categories(name), units(name)"
+    ).execute().data
+    products = sort_products_by_bopomofo(products, cs_map=cs_map)
 
     logs = sb.table("inventory_logs").select(
         "product_id, consumed_qty, log_date"
