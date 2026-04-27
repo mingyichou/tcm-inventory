@@ -1061,17 +1061,22 @@ def page_transactions():
             }
             options_keys = list(tx_options.keys())
 
-            # 預設選擇：表格選取列；無選取則用 selectbox 第一個
-            selected_idx = 0
+            # 表格選取列 → 同步寫入 session_state（必須在 selectbox 渲染前）
             if event.selection.rows:
-                selected_idx = event.selection.rows[0]
-                if selected_idx >= len(options_keys):
-                    selected_idx = 0
+                new_idx = event.selection.rows[0]
+                if 0 <= new_idx < len(options_keys):
+                    st.session_state["tx_hist_select"] = options_keys[new_idx]
+
+            # 若 session_state 的值已不在 options（例如改了搜尋條件），重置為第一個
+            if (
+                "tx_hist_select" not in st.session_state
+                or st.session_state.get("tx_hist_select") not in options_keys
+            ):
+                st.session_state["tx_hist_select"] = options_keys[0]
 
             selected_tx_key = st.selectbox(
                 "選擇紀錄（點上方表格自動選取）",
                 options_keys,
-                index=selected_idx,
                 key="tx_hist_select",
             )
             tx_item = tx_options[selected_tx_key]
