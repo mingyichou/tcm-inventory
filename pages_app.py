@@ -224,6 +224,92 @@ def recalc_stock(product_id: int, clinic_id: int):
     return new_stock
 
 
+def recalc_consumed_for_product(product_id: int, clinic_id: int):
+    """重算單一品項在指定診所的所有 inventory_logs 的 last/restock/consumed，並更新 clinic_stock。
+
+    規則：
+    - 第一次盤點：last=0, restock=0, consumed=0（沒基準）
+    - 後續盤點：last=上一筆 current_count，restock=兩筆之間 transactions 加總，consumed=last+restock-current
+    """
+    sb = get_supabase_client()
+    logs = sb.table("inventory_logs").select(
+        "id, log_date, current_count_qty"
+    ).eq("product_id", product_id).eq(
+        "clinic_id", clinic_id
+    ).order("log_date", desc=False).execute().data
+
+    if not logs:
+        recalc_stock(product_id, clinic_id)
+        return
+
+    txs = sb.table("transactions").select(
+        "change_qty, tx_date"
+    ).eq("product_id", product_id).eq(
+        "clinic_id", clinic_id
+    ).execute().data
+
+    prev_log_date = None
+    prev_count = 0.0
+
+    for log in logs:
+        log_date = log["log_date"]
+        current = float(log["current_count_qty"]) if log["current_count_qty"] is not None else 0.0
+
+        if prev_log_date is None:
+            last, restock, consumed = 0.0, 0.0, 0.0
+        else:
+            last = prev_count
+            restock = sum(
+                float(t["change_qty"]) for t in txs
+                if prev_log_date < t["tx_date"] <= log_date
+            )
+            consumed = last + restock - current
+
+        sb.table("inventory_logs").update({
+            "last_count_qty": round(last, 1),
+            "restock_qty_since_last": round(restock, 1),
+            "consumed_qty": round(consumed, 1),
+        }).eq("id", log["id"]).execute()
+
+        prev_log_date = log_date
+        prev_count = current
+
+    recalc_stock(product_id, clinic_id)
+
+
+def recalc_all_consumed_in_clinic(clinic_id: int) -> int:
+    """重算指定診所所有品項的 inventory_logs。回傳處理品項數。"""
+    sb = get_supabase_client()
+    pids = sb.table("inventory_logs").select(
+        "product_id"
+    ).eq("clinic_id", clinic_id).execute().data
+    pid_set = {p["product_id"] for p in pids}
+    for pid in pid_set:
+        recalc_consumed_for_product(int(pid), int(clinic_id))
+    return len(pid_set)
+
+
+def calc_avg_consumption(consumed_list_recent_first: list, max_n: int = 6) -> float:
+    """近 max_n 次耗用平均：負數當 0，加總 / 實際筆數（最多 max_n）。
+    consumed_list_recent_first: 由新到舊排序的耗用值清單。"""
+    if not consumed_list_recent_first:
+        return 0.0
+    recent = consumed_list_recent_first[:max_n]
+    total = sum(max(0.0, float(v)) for v in recent)
+    return total / len(recent)
+
+
+def build_recent_consumed_map(logs_desc: list, n: int = 6) -> dict:
+    """logs_desc 已按 log_date desc 排序。回傳 {pid: [近 n 筆 consumed_qty 由新到舊]}。"""
+    result = defaultdict(list)
+    for log in logs_desc:
+        pid = log["product_id"]
+        if len(result[pid]) < n:
+            v = log.get("consumed_qty")
+            result[pid].append(float(v) if v is not None else 0.0)
+    return result
+
+
 # ══════════════════════════════════════════════
 #  廠牌縮寫
 # ══════════════════════════════════════════════
@@ -532,11 +618,9 @@ def page_stock_overview():
         "product_id, current_count_qty, consumed_qty, log_date, session_id"
     ).eq("clinic_id", clinic_id).order("log_date", desc=True).execute().data
 
-    # 計算每品項平均耗用
-    consumed_by_product = defaultdict(list)
-    for log in all_logs:
-        if log["consumed_qty"] is not None and log["consumed_qty"] > 0:
-            consumed_by_product[log["product_id"]].append(float(log["consumed_qty"]))
+    # 計算每品項平均耗用（近 6 次，負數當 0，含 0 算分母）
+    # all_logs 已按 log_date desc 排序
+    consumed_recent_map = build_recent_consumed_map(all_logs, n=6)
 
     # 取得最近 3 個不重複的盤點日期
     seen_dates = []
@@ -625,10 +709,9 @@ def page_stock_overview():
 
         current_stock = float(cs["current_stock"]) if cs else 0
 
-        # 建議叫貨
-        avg_vals = consumed_by_product.get(pid, [])
-        avg_c = sum(avg_vals) / len(avg_vals) if avg_vals else 0
-        if avg_c > 0 and current_stock <= avg_c * safety_factor:
+        # 建議叫貨：近 6 次平均耗用 × 安全係數 < 即時庫存 ⇒ 不需叫
+        avg_c = calc_avg_consumption(consumed_recent_map.get(pid, []))
+        if avg_c > 0 and current_stock < avg_c * safety_factor:
             suggested = max(0, round(avg_c * stock_multiplier - current_stock, 1))
         else:
             suggested = 0
@@ -746,8 +829,8 @@ def page_stock_overview():
                         {"current_count_qty": new_qty}
                     ).eq("id", fix_log["id"]).execute()
 
-                    recalc_stock(fix_pid, clinic_id)
-                    st.success(f"已修正：{selected_name} {fix_log['log_date']} → {new_qty}")
+                    recalc_consumed_for_product(int(fix_pid), int(clinic_id))
+                    st.success(f"已修正：{selected_name} {fix_log['log_date']} → {new_qty}（已自動重算後續耗用量）")
                 except Exception as e:
                     st.error(f"修正失敗：{e}")
 
@@ -847,7 +930,9 @@ def page_transactions():
                             "tx_type": tx_type, "note": full_note, "created_by": user["id"],
                         }).execute()
 
-                        new_stock = recalc_stock(product["id"], clinic_id)
+                        recalc_consumed_for_product(int(product["id"]), int(clinic_id))
+                        new_stock = sb.table("clinic_stock").select("current_stock").eq(
+                            "product_id", product["id"]).eq("clinic_id", clinic_id).execute().data[0]["current_stock"]
                         st.success(f"已登錄：{product['name']} {qty:+.1f}（即時庫存：{new_stock}）")
                     except Exception as e:
                         st.error(f"登錄失敗：{e}")
@@ -921,8 +1006,8 @@ def page_transactions():
                             "change_qty": edit_qty, "tx_type": edit_type,
                             "note": edit_note or None,
                         }).eq("id", tx_item["id"]).execute()
-                        recalc_stock(tx_item["product_id"], clinic_id)
-                        st.success("已修改")
+                        recalc_consumed_for_product(int(tx_item["product_id"]), int(clinic_id))
+                        st.success("已修改（已自動重算耗用量）")
                         st.rerun()
                     except Exception as e:
                         st.error(f"修改失敗：{e}")
@@ -931,8 +1016,8 @@ def page_transactions():
                 if st.button("🗑️ 刪除此筆", type="secondary", key="tx_del_btn"):
                     try:
                         sb.table("transactions").delete().eq("id", tx_item["id"]).execute()
-                        recalc_stock(tx_item["product_id"], clinic_id)
-                        st.success("已刪除")
+                        recalc_consumed_for_product(int(tx_item["product_id"]), int(clinic_id))
+                        st.success("已刪除（已自動重算耗用量）")
                         st.rerun()
                     except Exception as e:
                         st.error(f"刪除失敗：{e}")
@@ -1499,7 +1584,7 @@ def page_inventory():
 
                                     sb.table("inventory_logs").insert(logs_to_insert).execute()
                                     for entry in logs_to_insert:
-                                        recalc_stock(entry["product_id"], int(clinic_id))
+                                        recalc_consumed_for_product(int(entry["product_id"]), int(clinic_id))
 
                                     st.session_state.photo_results = None
                                     st.success(f"照片盤點完成！{len(logs_to_insert)} 個品項（日期：{final_date}）")
@@ -1648,11 +1733,11 @@ def page_inventory():
                                     "期間進貨": restock_sum, "本次盤點": count_qty, "耗用量": consumed,
                                 })
 
-                            # 先寫入 logs，再重算庫存（recalc 要抓到新寫入的盤點）
+                            # 先寫入 logs，再重算每個品項的所有耗用（含 last/restock/consumed）
                             sb.table("inventory_logs").insert(logs_to_insert).execute()
 
                             for entry in logs_to_insert:
-                                recalc_stock(entry["product_id"], int(clinic_id))
+                                recalc_consumed_for_product(int(entry["product_id"]), int(clinic_id))
 
                             st.success(f"盤點完成！共 {len(results)} 個品項（日期：{inv_date}）")
                             if results:
@@ -1807,8 +1892,8 @@ def page_inventory():
                                     }).execute()
                                     inserted += 1
 
-                                # 重算即時庫存
-                                recalc_stock(int(pid), int(clinic_id))
+                                # 重算所有耗用量（含 last/restock/consumed）
+                                recalc_consumed_for_product(int(pid), int(clinic_id))
 
                             msg = []
                             if updated > 0:
@@ -1832,9 +1917,9 @@ def page_inventory():
                                     sb.table("inventory_logs").delete().eq("session_id", s["id"]).execute()
                                     sb.table("inventory_sessions").delete().eq("id", s["id"]).execute()
 
-                                    # 再重算每個受影響品項的庫存
+                                    # 再重算每個受影響品項的所有耗用量
                                     for pid in affected_pids:
-                                        recalc_stock(int(pid), int(clinic_id))
+                                        recalc_consumed_for_product(int(pid), int(clinic_id))
 
                                     st.success("已刪除整筆盤點")
                                     st.rerun()
@@ -2076,32 +2161,68 @@ def page_analytics():
         cid = get_clinic_id(selected_clinic)
         clinic_ids = [cid] if cid else []
 
-    all_logs = []
+    # 每診所獨立統計（避免兩診所混算 avg）
+    consumed_per_clinic = {cid: defaultdict(list) for cid in clinic_ids}
+    product_info = {}
+    has_any = False
     for cid in clinic_ids:
         resp = sb.table("inventory_logs").select(
-            "product_id, consumed_qty, products(name, category_id, categories(name), units(name))"
+            "product_id, consumed_qty, log_date, products(name, category_id, categories(name), units(name))"
         ).eq("clinic_id", cid).order("log_date", desc=True).execute()
-        all_logs.extend(resp.data)
+        if resp.data:
+            has_any = True
+        for log in resp.data:
+            pid = log["product_id"]
+            if len(consumed_per_clinic[cid][pid]) < 6:
+                v = log.get("consumed_qty")
+                consumed_per_clinic[cid][pid].append(float(v) if v is not None else 0.0)
+            product_info[pid] = {
+                "name": log["products"]["name"],
+                "category": log["products"]["categories"]["name"],
+                "unit": log["products"]["units"]["name"],
+            }
 
-    if not all_logs:
+    if not has_any:
         st.info("尚無盤點資料。")
         return
 
-    product_consumed = defaultdict(list)
-    product_info = {}
-    for log in all_logs:
-        pid = log["product_id"]
-        if log["consumed_qty"] is not None and log["consumed_qty"] > 0:
-            product_consumed[pid].append(float(log["consumed_qty"]))
-        product_info[pid] = {
-            "name": log["products"]["name"],
-            "category": log["products"]["categories"]["name"],
-            "unit": log["products"]["units"]["name"],
-        }
+    # 排名/常用統計用：合併兩診所
+    product_consumed_all = defaultdict(list)
+    for cid in clinic_ids:
+        for pid, vals in consumed_per_clinic[cid].items():
+            product_consumed_all[pid].extend(vals)
 
     # ── 診斷區（admin 限定，用於排查耗用/建議叫貨計算問題）──
     user_role = st.session_state.user.get("role")
     if user_role == "admin":
+        with st.expander("🔧 維護工具：一鍵重算 inventory_logs"):
+            st.caption("用途：清理因 transactions 修改/刪除或改錯存檔造成的髒資料。"
+                       "會重算每個品項所有 inventory_logs 的 last/restock/consumed，第一次盤點 consumed 設為 0。")
+            recalc_scope = st.radio(
+                "範圍",
+                ["僅當前診所", "全部診所（澤豐+澤沛）"],
+                key="recalc_scope",
+                horizontal=True,
+            )
+            if st.button("🔄 開始重算", type="primary", key="recalc_btn"):
+                with st.spinner("重算中⋯"):
+                    if recalc_scope == "僅當前診所":
+                        if selected_clinic == "合併檢視":
+                            st.warning("請先切換到單一診所")
+                        else:
+                            cid = get_clinic_id(selected_clinic)
+                            n = recalc_all_consumed_in_clinic(cid)
+                            st.success(f"完成：{selected_clinic} 已重算 {n} 個品項")
+                    else:
+                        total = 0
+                        for cn in ("澤豐", "澤沛"):
+                            cid = get_clinic_id(cn)
+                            if cid:
+                                n = recalc_all_consumed_in_clinic(cid)
+                                total += n
+                                st.write(f"・{cn}：{n} 個品項")
+                        st.success(f"完成：共重算 {total} 個品項")
+
         with st.expander("🔍 診斷：列出指定品項的所有盤點紀錄"):
             st.caption(f"目前診所：{selected_clinic}（clinic_ids={clinic_ids}）")
             diag_products = sb.table("products").select("id, name").execute().data
@@ -2152,12 +2273,14 @@ def page_analytics():
         stock_map = {(s["product_id"], s["clinic_id"]): float(s["current_stock"]) for s in stock_data}
 
         reorder_rows = []
-        for pid, consumed_list in product_consumed.items():
-            avg = sum(consumed_list) / len(consumed_list)
-            if avg <= 0:
-                continue
-            info = product_info[pid]
-            for cid in clinic_ids:
+        for cid in clinic_ids:
+            for pid, consumed_list in consumed_per_clinic[cid].items():
+                avg = calc_avg_consumption(consumed_list)
+                if avg <= 0:
+                    continue
+                info = product_info.get(pid)
+                if not info:
+                    continue
                 current = stock_map.get((pid, cid), 0)
                 if current < avg * safety:
                     reorder_rows.append({
@@ -2183,14 +2306,19 @@ def page_analytics():
         rank_cat = st.selectbox("分類", ["全部"] + [c["name"] for c in categories], key="rank_cat")
 
         ranking = []
-        for pid, consumed_list in product_consumed.items():
-            info = product_info[pid]
+        for pid, consumed_list in product_consumed_all.items():
+            info = product_info.get(pid)
+            if not info:
+                continue
             if rank_cat != "全部" and info["category"] != rank_cat:
                 continue
-            total = sum(consumed_list)
+            # 排名只計正值
+            positive = [v for v in consumed_list if v > 0]
+            total = sum(positive)
             if total > 0:
                 ranking.append({"品項": info["name"], "分類": info["category"],
-                                "總耗用量": round(total, 1), "平均耗用": round(total / len(consumed_list), 1)})
+                                "總耗用量": round(total, 1),
+                                "平均耗用": round(calc_avg_consumption(consumed_list), 1)})
 
         if ranking:
             rank_df = pd.DataFrame(ranking).sort_values("總耗用量", ascending=False).reset_index(drop=True)
@@ -2353,11 +2481,10 @@ def page_order():
     ).eq("clinic_id", clinic_id).execute().data
     cs_map = {s["product_id"]: s for s in cs_data}
 
-    logs = sb.table("inventory_logs").select("product_id, consumed_qty").eq("clinic_id", clinic_id).execute().data
-    consumed_data = defaultdict(list)
-    for l in logs:
-        if l["consumed_qty"] and l["consumed_qty"] > 0:
-            consumed_data[l["product_id"]].append(float(l["consumed_qty"]))
+    logs = sb.table("inventory_logs").select(
+        "product_id, consumed_qty, log_date"
+    ).eq("clinic_id", clinic_id).order("log_date", desc=True).execute().data
+    consumed_data = build_recent_consumed_map(logs, n=6)
 
     st.subheader("步驟一：編輯叫貨清單")
     show_all = st.checkbox("顯示所有品項", value=False)
@@ -2369,9 +2496,8 @@ def page_order():
             continue
 
         current = float(cs["current_stock"])
-        vals = consumed_data.get(p["id"], [])
-        avg = sum(vals) / len(vals) if vals else 0
-        auto = current < avg * safety and avg > 0
+        avg = calc_avg_consumption(consumed_data.get(p["id"], []))
+        auto = avg > 0 and current < avg * safety
         suggested = max(0, round(avg * multiplier - current, 1)) if auto else 0
 
         order_rows.append({
