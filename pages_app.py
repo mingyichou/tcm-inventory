@@ -353,21 +353,23 @@ def _build_stock_excel(df, clinic_name, recent_dates, product_log_map, tx_by_pro
     left_align = Alignment(horizontal="left", vertical="center")
 
     # 欄位定義 — col_specs: [(header, source_key, width)]
+    # 順序：注音、品項、櫃、廠1、廠2、(日期、進貨、耗用)×N、最末日期、進貨(到今)
     col_specs = [
-        ("注", "_initial", 5),
-        ("品項", "name", 20),
-        ("櫃", "cabinet", 5),
-        ("廠1", "b1", 5),
-        ("廠2", "b2", 5),
+        ("注", "_initial", 4),
+        ("品項", "name", 18),
+        ("櫃", "cabinet", 4),
+        ("廠1", "b1", 3),
+        ("廠2", "b2", 3),
     ]
     for i, d in enumerate(recent_dates):
         sd = short_date(d)
-        col_specs.append((sd, ("inv", d), 8))
+        col_specs.append((sd, ("inv", d), 6))
         if i < len(recent_dates) - 1:
             d_next = recent_dates[i + 1]
-            col_specs.append(("進貨", ("restock", d, d_next), 7))
+            col_specs.append(("進貨", ("restock", d, d_next), 6))
+            col_specs.append(("耗用", ("consume", d, d_next), 6))
     if recent_dates:
-        col_specs.append(("進(~今)", ("restock_now", recent_dates[-1]), 8))
+        col_specs.append(("進貨", ("restock_now", recent_dates[-1]), 6))
 
     MERGE_CATS = {"水藥材", "高貴藥材", "非健保藥材"}
 
@@ -396,6 +398,16 @@ def _build_stock_excel(df, clinic_name, recent_dates, product_log_map, tx_by_pro
                 v = sum(float(tx["change_qty"]) for tx in tx_by_product.get(pid, [])
                         if d_a < tx["tx_date"] <= d_b)
                 return round(v, 1) if v else ""
+            if t == "consume":
+                d_a, d_b = src[1], src[2]
+                lg_a = p_logs.get(d_a)
+                lg_b = p_logs.get(d_b)
+                if lg_a and lg_b:
+                    restock = sum(float(tx["change_qty"]) for tx in tx_by_product.get(pid, [])
+                                  if d_a < tx["tx_date"] <= d_b)
+                    v = round(float(lg_a["current_count_qty"]) + restock - float(lg_b["current_count_qty"]), 1)
+                    return v if v else ""
+                return ""
             if t == "restock_now":
                 v = sum(float(tx["change_qty"]) for tx in tx_by_product.get(pid, [])
                         if tx["tx_date"] > src[1])
@@ -1223,25 +1235,25 @@ def page_inventory():
             lft = Alignment(horizontal="left", vertical="center")
 
             # 組欄位
+            # 順序：注、品項、櫃、廠1、廠2、(日期、進貨、耗用)×(N-1)、最末日期、進貨(到今)、日期:
             pcols = []  # (header, width, data_key_or_None)
-            pcols.append(("注", 5, "_initial"))
-            pcols.append(("品項", 18, "_name"))
-            pcols.append(("櫃", 5, "_cabinet"))
-            pcols.append(("廠1", 4, "_b1"))
-            pcols.append(("廠2", 4, "_b2"))
+            pcols.append(("注", 4, "_initial"))
+            pcols.append(("品項", 16, "_name"))
+            pcols.append(("櫃", 4, "_cabinet"))
+            pcols.append(("廠1", 3, "_b1"))
+            pcols.append(("廠2", 3, "_b2"))
 
             for i, d in enumerate(p_display):
                 sd = short_date(d)
-                pcols.append((sd, 5, f"_inv_{d}"))
+                pcols.append((sd, 6, f"_inv_{d}"))
                 if i < len(p_display) - 1:
                     pcols.append(("進貨", 5, f"_restock_{d}"))
                     pcols.append(("耗用", 5, f"_consume_{d}"))
-                else:
-                    # 最新盤點後也加進貨+耗用（新生成）
-                    pcols.append(("進貨", 5, f"_restock_{d}"))
-                    pcols.append(("耗用", 5, f"_consume_{d}"))
+            # 最新盤點後到今的進貨（無耗用，因尚無下次盤點）
+            if p_display:
+                pcols.append(("進貨", 6, f"_restock_{p_display[-1]}"))
 
-            pcols.append(("日期:      ", 10, "_new"))  # 新盤點欄，2倍寬
+            pcols.append(("日期:", 14, "_new"))  # 新盤點手寫欄，加寬
 
             buf = io.BytesIO()
             wb = Workbook()
