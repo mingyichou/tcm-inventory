@@ -344,8 +344,10 @@ def _build_stock_excel(df, clinic_name, recent_dates, product_log_map, tx_by_pro
     thin = Side(style="thin")
     double = Side(style="double")
     border_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
-    header_font = Font(bold=True, size=13)
+    header_bold_font = Font(bold=True, size=13)
+    header_norm_font = Font(size=13)  # 進貨/耗用 header 用普通字以視覺區隔
     data_font = Font(size=13)
+    data_bold_font = Font(bold=True, size=13)  # 盤點欄資料粗體
     cat_title_font = Font(bold=True, size=14)
     red_font = Font(size=13, bold=True, color="C00000")
     red_fill = PatternFill("solid", fgColor="FFE5E5")
@@ -353,13 +355,13 @@ def _build_stock_excel(df, clinic_name, recent_dates, product_log_map, tx_by_pro
     left_align = Alignment(horizontal="left", vertical="center")
 
     # 欄位定義 — col_specs: [(header, source_key, width)]
-    # 順序：注音、品項、櫃、廠1、廠2、(日期、進貨、耗用)×N、最末日期、進貨(到今)
+    # 順序：注音、品項、櫃、廠1、廠2、(日期、進貨、耗用)×(N-1)、最末日期、進貨(到今)、耗用(留空供手算)
     col_specs = [
         ("注", "_initial", 4),
-        ("品項", "name", 18),
-        ("櫃", "cabinet", 4),
-        ("廠1", "b1", 3),
-        ("廠2", "b2", 3),
+        ("品項", "name", 16),
+        ("櫃", "cabinet", 5),
+        ("廠1", "b1", 4),
+        ("廠2", "b2", 4),
     ]
     for i, d in enumerate(recent_dates):
         sd = short_date(d)
@@ -369,7 +371,9 @@ def _build_stock_excel(df, clinic_name, recent_dates, product_log_map, tx_by_pro
             col_specs.append(("進貨", ("restock", d, d_next), 6))
             col_specs.append(("耗用", ("consume", d, d_next), 6))
     if recent_dates:
+        # 最末盤點後：進貨(到今) + 耗用(空欄供系統異常時手算)
         col_specs.append(("進貨", ("restock_now", recent_dates[-1]), 6))
+        col_specs.append(("耗用", ("consume_now", recent_dates[-1]), 6))
 
     MERGE_CATS = {"水藥材", "高貴藥材", "非健保藥材"}
 
@@ -412,6 +416,9 @@ def _build_stock_excel(df, clinic_name, recent_dates, product_log_map, tx_by_pro
                 v = sum(float(tx["change_qty"]) for tx in tx_by_product.get(pid, [])
                         if tx["tx_date"] > src[1])
                 return round(v, 1) if v else ""
+            if t == "consume_now":
+                # 系統無法計算（需下次盤點才知），保留空白供手算
+                return ""
         return ""
 
     def _setup_page(ws):
@@ -428,10 +435,17 @@ def _build_stock_excel(df, clinic_name, recent_dates, product_log_map, tx_by_pro
         ws.page_margins.header = 0.2
         ws.page_margins.footer = 0.2
 
+    def _is_inv_src(src):
+        return isinstance(src, tuple) and src[0] == "inv"
+
+    def _is_flow_src(src):
+        return isinstance(src, tuple) and src[0] in ("restock", "consume", "restock_now", "consume_now")
+
     def _write_header(ws):
-        for ci, (header, _, width) in enumerate(col_specs, 1):
+        for ci, (header, src, width) in enumerate(col_specs, 1):
             cell = ws.cell(row=1, column=ci, value=header)
-            cell.font = header_font
+            # 進貨/耗用 header 用普通字體；其他（注/品項/櫃/廠/盤點）粗體
+            cell.font = header_norm_font if _is_flow_src(src) else header_bold_font
             cell.alignment = center
             cell.border = border_thin
             ws.column_dimensions[get_column_letter(ci)].width = width
@@ -460,10 +474,13 @@ def _build_stock_excel(df, clinic_name, recent_dates, product_log_map, tx_by_pro
                 cell = ws.cell(row=row_num, column=ci, value=val)
                 cell.border = border_thin
                 cell.alignment = left_align if src == "name" else center
-                # C 開頭櫃位 → 紅字紅底（並讓整行的「櫃」欄變紅）
+                # C 開頭櫃位 → 紅字紅底
                 if src == "cabinet" and is_c_cabinet:
                     cell.font = red_font
                     cell.fill = red_fill
+                elif _is_inv_src(src):
+                    # 盤點欄資料粗體（與耗用/進貨區分）
+                    cell.font = data_bold_font
                 else:
                     cell.font = data_font
             ws.row_dimensions[row_num].height = 22
@@ -1227,33 +1244,36 @@ def page_inventory():
             thin = Side(style="thin")
             double = Side(style="double")
             border_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
-            hdr_font = Font(bold=True, size=13)
+            hdr_bold_font = Font(bold=True, size=13)  # 盤點/品項/廠等
+            hdr_norm_font = Font(size=13)  # 進貨/耗用 header 普通字體以區分
             dat_font = Font(size=12)
+            dat_bold_font = Font(bold=True, size=12)  # 盤點欄資料粗體
             red_font = Font(size=12, bold=True, color="C00000")
             red_fill = PatternFill("solid", fgColor="FFE5E5")
             ctr = Alignment(horizontal="center", vertical="center")
             lft = Alignment(horizontal="left", vertical="center")
 
             # 組欄位
-            # 順序：注、品項、櫃、廠1、廠2、(日期、進貨、耗用)×(N-1)、最末日期、進貨(到今)、日期:
-            pcols = []  # (header, width, data_key_or_None)
-            pcols.append(("注", 4, "_initial"))
-            pcols.append(("品項", 16, "_name"))
+            # 順序：注、品項、櫃、廠1、廠2、(日期、進貨、耗用)×(N-1)、最末日期、進貨(到今)、耗用(空欄手算)、日期:
+            pcols = []  # (header, width, data_key)
+            pcols.append(("注", 3, "_initial"))
+            pcols.append(("品項", 14, "_name"))
             pcols.append(("櫃", 4, "_cabinet"))
             pcols.append(("廠1", 3, "_b1"))
             pcols.append(("廠2", 3, "_b2"))
 
             for i, d in enumerate(p_display):
                 sd = short_date(d)
-                pcols.append((sd, 6, f"_inv_{d}"))
+                pcols.append((sd, 5, f"_inv_{d}"))
                 if i < len(p_display) - 1:
                     pcols.append(("進貨", 5, f"_restock_{d}"))
                     pcols.append(("耗用", 5, f"_consume_{d}"))
-            # 最新盤點後到今的進貨（無耗用，因尚無下次盤點）
+            # 最末盤點後：進貨(到今) + 耗用(空欄供系統異常時手算)
             if p_display:
-                pcols.append(("進貨", 6, f"_restock_{p_display[-1]}"))
+                pcols.append(("進貨", 5, f"_restock_{p_display[-1]}"))
+                pcols.append(("耗用", 5, f"_consume_{p_display[-1]}"))
 
-            pcols.append(("日期:", 14, "_new"))  # 新盤點手寫欄，加寬
+            pcols.append(("日期:", 12, "_new"))  # 新盤點手寫欄
 
             buf = io.BytesIO()
             wb = Workbook()
@@ -1280,10 +1300,13 @@ def page_inventory():
                 ws.page_margins.header = 0.2
                 ws.page_margins.footer = 0.2
 
-                # 表頭
-                for ci, (h, w, _) in enumerate(pcols, 1):
+                # 表頭：進貨/耗用 用普通字體；其他用粗體
+                for ci, (h, w, key) in enumerate(pcols, 1):
                     cell = ws.cell(row=1, column=ci, value=h)
-                    cell.font = hdr_font
+                    if key.startswith("_restock_") or key.startswith("_consume_"):
+                        cell.font = hdr_norm_font
+                    else:
+                        cell.font = hdr_bold_font
                     cell.alignment = ctr
                     cell.border = border_thin
                     ws.column_dimensions[get_column_letter(ci)].width = w
@@ -1359,6 +1382,9 @@ def page_inventory():
                         if key == "_cabinet" and isinstance(val, str) and val and val[0] in ("C", "c"):
                             cell.font = red_font
                             cell.fill = red_fill
+                        elif key.startswith("_inv_"):
+                            # 盤點欄資料粗體（與耗用/進貨區分）
+                            cell.font = dat_bold_font
                         else:
                             cell.font = dat_font
                     ws.row_dimensions[row_num].height = 22
@@ -1387,10 +1413,13 @@ def page_inventory():
                 ws.page_margins.right = 0.3
                 ws.page_margins.top = 0.4
                 ws.page_margins.bottom = 0.4
-                # 表頭
-                for ci, (h, w, _) in enumerate(pcols, 1):
+                # 表頭：進貨/耗用 普通字體；其他粗體
+                for ci, (h, w, key) in enumerate(pcols, 1):
                     cell = ws.cell(row=1, column=ci, value=h)
-                    cell.font = hdr_font
+                    if key.startswith("_restock_") or key.startswith("_consume_"):
+                        cell.font = hdr_norm_font
+                    else:
+                        cell.font = hdr_bold_font
                     cell.alignment = ctr
                     cell.border = border_thin
                     ws.column_dimensions[get_column_letter(ci)].width = w
@@ -1435,6 +1464,8 @@ def page_inventory():
                             if key == "_cabinet" and isinstance(val, str) and val and val[0] in ("C", "c"):
                                 cell.font = red_font
                                 cell.fill = red_fill
+                            elif key.startswith("_inv_"):
+                                cell.font = dat_bold_font
                             else:
                                 cell.font = dat_font
                         ws.row_dimensions[row_num].height = 22
