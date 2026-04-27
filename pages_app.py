@@ -310,13 +310,21 @@ def calc_avg_consumption(consumed_list_recent_first: list, max_n: int = 6) -> fl
 
 
 def build_recent_consumed_map(logs_desc: list, n: int = 6) -> dict:
-    """logs_desc 已按 log_date desc 排序。回傳 {pid: [近 n 筆 consumed_qty 由新到舊]}。"""
-    result = defaultdict(list)
+    """logs_desc 已按 log_date desc 排序。回傳 {pid: [近 n 筆 consumed_qty 由新到舊]}。
+    重要：排除每品項最早的那一筆 — 首次盤點的 consumed=0 是人為 placeholder（沒基準），不應計入平均。"""
+    by_pid_full = defaultdict(list)
     for log in logs_desc:
-        pid = log["product_id"]
-        if len(result[pid]) < n:
-            v = log.get("consumed_qty")
-            result[pid].append(float(v) if v is not None else 0.0)
+        by_pid_full[log["product_id"]].append(log)
+
+    result = {}
+    for pid, plogs in by_pid_full.items():
+        # plogs 已是 desc，最後一筆是最早的（首次盤點）→ 排除
+        non_first = plogs[:-1] if len(plogs) > 1 else []
+        recent = non_first[:n]
+        result[pid] = [
+            float(log.get("consumed_qty") or 0)
+            for log in recent
+        ]
     return result
 
 
@@ -2343,8 +2351,8 @@ def page_analytics():
         cid = get_clinic_id(selected_clinic)
         clinic_ids = [cid] if cid else []
 
-    # 每診所獨立統計（避免兩診所混算 avg）
-    consumed_per_clinic = {cid: defaultdict(list) for cid in clinic_ids}
+    # 每診所獨立統計（避免兩診所混算 avg；首盤 placeholder 由 build_recent_consumed_map 自動排除）
+    consumed_per_clinic = {}
     product_info = {}
     has_any = False
     for cid in clinic_ids:
@@ -2353,16 +2361,15 @@ def page_analytics():
         ).eq("clinic_id", cid).order("log_date", desc=True).execute()
         if resp.data:
             has_any = True
+        consumed_per_clinic[cid] = build_recent_consumed_map(resp.data, n=6)
         for log in resp.data:
             pid = log["product_id"]
-            if len(consumed_per_clinic[cid][pid]) < 6:
-                v = log.get("consumed_qty")
-                consumed_per_clinic[cid][pid].append(float(v) if v is not None else 0.0)
-            product_info[pid] = {
-                "name": log["products"]["name"],
-                "category": log["products"]["categories"]["name"],
-                "unit": log["products"]["units"]["name"],
-            }
+            if pid not in product_info:
+                product_info[pid] = {
+                    "name": log["products"]["name"],
+                    "category": log["products"]["categories"]["name"],
+                    "unit": log["products"]["units"]["name"],
+                }
 
     if not has_any:
         st.info("尚無盤點資料。")
