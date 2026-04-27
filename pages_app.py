@@ -632,8 +632,18 @@ def page_stock_overview():
     # 計算每品項平均耗用（近 6 次，負數當 0，含 0 算分母）
     consumed_recent_map = build_recent_consumed_map(all_logs, n=6)
 
-    # 取所有不重複盤點日期（asc：舊→新）
-    all_dates = sorted({log["log_date"] for log in all_logs})
+    # 取最近 12 次不重複盤點日期（asc：舊→新）— 限制顯示量避免欄位過多
+    MAX_DISPLAY_DATES = 12
+    seen_d = set()
+    recent_desc = []
+    for log in all_logs:  # already desc by log_date
+        d = log["log_date"]
+        if d not in seen_d:
+            seen_d.add(d)
+            recent_desc.append(d)
+        if len(recent_desc) >= MAX_DISPLAY_DATES:
+            break
+    all_dates = sorted(recent_desc)
 
     # 動態建立欄位定義 [(col_name, ctype, meta), ...]
     # ctype: "inv"=盤點 / "restock"=兩盤之間進貨 / "consume"=兩盤之間耗用 / "restock_now"=最後盤點到今的進貨
