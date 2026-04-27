@@ -101,20 +101,60 @@ def short_date(d: str) -> str:
     return d[5:7] + "/" + d[8:10] if d and len(d) >= 10 else d or "-"
 
 
-def style_banded(df, highlight_col=None):
-    """每 5 行加粗底線分隔，可指定特定欄位加重點色"""
+# 顯示時 0 視為空白的欄位（活動量類，不含庫存盤點數）
+ZERO_HIDE_PATTERNS = ("進(", "耗(", "進貨", "耗用")
+ZERO_HIDE_EXACT = {"建議叫貨", "叫貨", "平均耗用", "建議數量", "叫貨數量"}
+
+
+def _should_hide_zero(col_name) -> bool:
+    if not isinstance(col_name, str):
+        return False
+    if col_name in ZERO_HIDE_EXACT:
+        return True
+    return any(col_name.startswith(p) for p in ZERO_HIDE_PATTERNS)
+
+
+def hide_zeros_in_cols(df: pd.DataFrame, cols=None) -> pd.DataFrame:
+    """把指定欄位的 0 換成 None（顯示為空白）。cols=None 時自動偵測活動量欄位。"""
+    df = df.copy()
+    if cols is None:
+        cols = [c for c in df.columns if _should_hide_zero(c)]
+    for c in cols:
+        if c in df.columns:
+            df[c] = df[c].apply(lambda v: None if pd.notna(v) and v == 0 else v)
+    return df
+
+
+def style_banded(df, highlight_col=None, bold_cols=None, big_bold_col=None):
+    """每 5 行加粗底線分隔；highlight_col 加重點色；bold_cols 粗體；big_bold_col 大字粗體。
+    數字欄位 0 自動隱藏（活動量類）。"""
+    bold_cols = set(bold_cols or [])
+    hide_zero_cols = {c for c in df.columns if _should_hide_zero(c)}
+
     def row_style(row):
         idx = row.name if isinstance(row.name, int) else 0
         border = "border-bottom: 2.5px solid #6A5ACD" if (idx + 1) % 5 == 0 else ""
         styles = [border] * len(row)
-        if highlight_col and highlight_col in df.columns:
-            col_idx = df.columns.get_loc(highlight_col)
-            hl = "background-color: #E8E0F0; font-weight: bold; border-left: 3px solid #6A5ACD"
-            styles[col_idx] = hl + ("; " + border if border else "")
+        for ci, col in enumerate(df.columns):
+            extra = []
+            if col in bold_cols:
+                extra.append("font-weight: bold")
+            if col == big_bold_col:
+                extra.append("font-weight: bold; font-size: 1.15em; color: #6A5ACD")
+            if col == highlight_col:
+                extra.append("background-color: #E8E0F0; font-weight: bold; border-left: 3px solid #6A5ACD")
+            if extra:
+                base = styles[ci]
+                styles[ci] = "; ".join([base] + extra) if base else "; ".join(extra)
         return styles
-    # 數字欄位格式化為小數1位，None 顯示空白
+
     num_cols = df.select_dtypes(include=["number", "float", "int"]).columns.tolist()
-    fmt = {c: lambda v: "" if pd.isna(v) else f"{v:.1f}" for c in num_cols}
+    fmt = {}
+    for c in num_cols:
+        if c in hide_zero_cols:
+            fmt[c] = lambda v: "" if pd.isna(v) or v == 0 else f"{v:.1f}"
+        else:
+            fmt[c] = lambda v: "" if pd.isna(v) else f"{v:.1f}"
     return df.style.apply(row_style, axis=1).format(fmt)
 
 
@@ -281,7 +321,15 @@ def _build_stock_excel(df, clinic_name, h3, hr32, hc32, h2, hr21, hc21, h1):
                     val = abbr_brand(r["廠牌2"])
                 elif df_col and df_col in r.index:
                     v = r[df_col]
-                    val = round(float(v), 1) if pd.notna(v) and v != "" else ""
+                    if pd.isna(v) or v == "":
+                        val = ""
+                    else:
+                        fv = float(v)
+                        # 活動量類欄位 0 → 空白
+                        if fv == 0 and _should_hide_zero(df_col):
+                            val = ""
+                        else:
+                            val = round(fv, 1)
                 else:
                     val = ""
                 cell = ws.cell(row=row_num, column=ci, value=val)
@@ -411,7 +459,8 @@ def _build_order_excel(order_data):
                 c1 = ws.cell(row=row_num, column=i * 2 + 1, value=item.品項)
                 c1.font = data_font
                 c1.border = border_thin
-                c2 = ws.cell(row=row_num, column=i * 2 + 2, value=round(float(item.叫貨數量), 1))
+                _qty = float(item.叫貨數量)
+                c2 = ws.cell(row=row_num, column=i * 2 + 2, value=("" if _qty == 0 else round(_qty, 1)))
                 c2.font = data_font
                 c2.alignment = center
                 c2.border = border_thin
@@ -606,6 +655,8 @@ def page_stock_overview():
         return
 
     df = pd.DataFrame(rows)
+    # 0 顯示空白（活動量類欄位）
+    df_display = hide_zeros_in_cols(df)
 
     # 主表格（data_editor：叫貨欄可編輯，其餘唯讀）
     col_config = {
@@ -614,22 +665,22 @@ def page_stock_overview():
         "廠牌1": st.column_config.TextColumn(disabled=True),
         "櫃位": st.column_config.TextColumn(disabled=True),
         "廠牌2": st.column_config.TextColumn(disabled=True),
-        h3: st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        h3: st.column_config.NumberColumn(f"📋 {h3}", disabled=True, format="%.1f"),
         hr32: st.column_config.NumberColumn(disabled=True, format="%.1f"),
         hc32: st.column_config.NumberColumn(disabled=True, format="%.1f"),
-        h2: st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        h2: st.column_config.NumberColumn(f"📋 {h2}", disabled=True, format="%.1f"),
         hr21: st.column_config.NumberColumn(disabled=True, format="%.1f"),
         hc21: st.column_config.NumberColumn(disabled=True, format="%.1f"),
-        h1: st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        h1: st.column_config.NumberColumn(f"📋 {h1}", disabled=True, format="%.1f"),
         "進(迄今)": st.column_config.NumberColumn(disabled=True, format="%.1f"),
-        "即時庫存": st.column_config.NumberColumn(disabled=True, format="%.1f"),
+        "即時庫存": st.column_config.NumberColumn("⭐ 即時庫存", disabled=True, format="%.1f"),
         "建議叫貨": st.column_config.NumberColumn(disabled=True, format="%.1f"),
         "叫貨": st.column_config.NumberColumn("叫貨 ✏️", min_value=0, format="%.1f"),
     }
 
     edited_stock_df = st.data_editor(
-        df, use_container_width=True, hide_index=True,
-        height=min(len(df) * 35 + 38, 700),
+        df_display, use_container_width=True, hide_index=True,
+        height=min(len(df_display) * 35 + 38, 700),
         column_config=col_config, key="stock_editor",
     )
 
@@ -833,10 +884,10 @@ def page_transactions():
             } for t in resp.data]
 
             hist_df = pd.DataFrame(hist_rows)
-            styled = style_banded(hist_df)
+            styled = style_banded(hist_df, bold_cols=["數量"])
             styled = styled.map(
                 lambda v: "color:#DC3545;font-weight:bold" if isinstance(v, (int, float)) and v < 0 else (
-                    "color:#28A745" if isinstance(v, (int, float)) and v > 0 else ""),
+                    "color:#28A745;font-weight:bold" if isinstance(v, (int, float)) and v > 0 else ""),
                 subset=["數量"],
             )
             st.dataframe(styled, use_container_width=True, hide_index=True, height=400)
@@ -2048,6 +2099,44 @@ def page_analytics():
             "unit": log["products"]["units"]["name"],
         }
 
+    # ── 診斷區（admin 限定，用於排查耗用/建議叫貨計算問題）──
+    user_role = st.session_state.user.get("role")
+    if user_role == "admin":
+        with st.expander("🔍 診斷：列出指定品項的所有盤點紀錄"):
+            st.caption(f"目前診所：{selected_clinic}（clinic_ids={clinic_ids}）")
+            diag_products = sb.table("products").select("id, name").execute().data
+            diag_products = sorted(diag_products, key=lambda p: get_bopomofo_sort_key(p["name"]))
+            diag_options = {p["name"]: p["id"] for p in diag_products}
+            diag_sel = st.selectbox("品項", list(diag_options.keys()), key="diag_pid_select")
+            diag_pid = diag_options[diag_sel]
+
+            for cid in clinic_ids:
+                clinic_label = "澤豐" if cid == 1 else "澤沛" if cid == 2 else f"id={cid}"
+                st.markdown(f"**【{clinic_label}】 inventory_logs**")
+                d_logs = sb.table("inventory_logs").select(
+                    "id, session_id, log_date, last_count_qty, "
+                    "restock_qty_since_last, current_count_qty, consumed_qty"
+                ).eq("product_id", diag_pid).eq("clinic_id", cid).order(
+                    "log_date", desc=False
+                ).execute().data
+                if d_logs:
+                    st.dataframe(pd.DataFrame(d_logs), use_container_width=True, hide_index=True)
+                    st.caption(f"共 {len(d_logs)} 筆")
+                else:
+                    st.info("無紀錄")
+
+                st.markdown(f"**【{clinic_label}】 transactions**")
+                d_tx = sb.table("transactions").select(
+                    "id, tx_date, tx_type, change_qty, note"
+                ).eq("product_id", diag_pid).eq("clinic_id", cid).order(
+                    "tx_date", desc=False
+                ).execute().data
+                if d_tx:
+                    st.dataframe(pd.DataFrame(d_tx), use_container_width=True, hide_index=True)
+                    st.caption(f"共 {len(d_tx)} 筆")
+                else:
+                    st.info("無紀錄")
+
     tab_reorder, tab_ranking, tab_cabinet = st.tabs(["📦 建議叫貨", "🏆 常用排名", "🗄️ 櫃位分類"])
 
     with tab_reorder:
@@ -2080,8 +2169,12 @@ def page_analytics():
 
         if reorder_rows:
             reorder_df = pd.DataFrame(reorder_rows).sort_values(["診所", "分類"]).reset_index(drop=True)
-            st.dataframe(style_banded(reorder_df),
-                         use_container_width=True, hide_index=True)
+            st.dataframe(
+                style_banded(reorder_df,
+                             bold_cols=["平均耗用", "建議叫貨"],
+                             big_bold_col="目前庫存"),
+                use_container_width=True, hide_index=True,
+            )
         else:
             st.success("所有品項庫存充足")
 
@@ -2102,7 +2195,10 @@ def page_analytics():
         if ranking:
             rank_df = pd.DataFrame(ranking).sort_values("總耗用量", ascending=False).reset_index(drop=True)
             st.bar_chart(rank_df.head(15).set_index("品項")[["總耗用量"]], color="#6A5ACD")
-            st.dataframe(style_banded(rank_df), use_container_width=True, hide_index=True)
+            st.dataframe(
+                style_banded(rank_df, bold_cols=["總耗用量", "平均耗用"]),
+                use_container_width=True, hide_index=True,
+            )
 
     with tab_cabinet:
         if selected_clinic == "合併檢視":
@@ -2149,7 +2245,10 @@ def page_analytics():
 
                 # 依櫃位排序
                 cab_df = cab_df.sort_values(["櫃位", "品項"]).reset_index(drop=True)
-                st.dataframe(style_banded(cab_df), use_container_width=True, hide_index=True)
+                st.dataframe(
+                    style_banded(cab_df, big_bold_col="庫存"),
+                    use_container_width=True, hide_index=True,
+                )
 
                 # 匯出
                 if st.button("📥 匯出櫃位分類表", type="primary"):
@@ -2288,6 +2387,8 @@ def page_order():
     if display.empty:
         st.success("所有品項庫存充足！")
         return
+
+    display = hide_zeros_in_cols(display, ["建議數量", "叫貨數量"])
 
     edited = st.data_editor(
         display[["勾選", "品項", "分類", "單位", "目前庫存", "建議數量", "叫貨數量", "廠牌"]],
@@ -2494,7 +2595,12 @@ def page_settings():
 
         st.subheader("現有帳號")
         for u in users:
-            with st.expander(f"👤 {u['display_name'] or u['username']}（{u['role']}）"):
+            display_label = u['display_name'] or u['username']
+            with st.expander(f"👤 {display_label} ｜ 帳號：{u['username']} ｜ {u['role']}"):
+                st.text_input(
+                    "帳號（不可修改）", value=u["username"],
+                    key=f"uname_{u['id']}", disabled=True,
+                )
                 col1, col2 = st.columns(2)
                 with col1:
                     new_display = st.text_input("顯示名稱", value=u["display_name"] or "", key=f"ud_{u['id']}")
