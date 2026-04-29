@@ -990,27 +990,38 @@ def page_transactions():
             if qty == 0:
                 st.error("數量不可為 0")
             else:
-                try:
-                    full_note = f"[{tx_brand}] {note}".strip() if tx_brand != "-" else (note or None)
-                    # 同日同品項重複偵測（提示但不阻擋）
-                    dup_resp = sb.table("transactions").select("id").eq(
+                # 進貨類型：同日同品項已存在 → 拒絕登錄
+                dup_resp = []
+                if tx_type == "進貨":
+                    dup_resp = sb.table("transactions").select("id, change_qty").eq(
                         "product_id", product["id"]).eq(
                         "clinic_id", clinic_id).eq(
-                        "tx_date", str(tx_date)).execute().data
-                    sb.table("transactions").insert({
-                        "product_id": product["id"], "clinic_id": clinic_id,
-                        "change_qty": qty, "tx_date": str(tx_date),
-                        "tx_type": tx_type, "note": full_note, "created_by": user["id"],
-                    }).execute()
+                        "tx_date", str(tx_date)).eq(
+                        "tx_type", "進貨").execute().data
 
-                    recalc_consumed_for_product(int(product["id"]), int(clinic_id))
-                    new_stock = sb.table("clinic_stock").select("current_stock").eq(
-                        "product_id", product["id"]).eq("clinic_id", clinic_id).execute().data[0]["current_stock"]
-                    st.success(f"已登錄：{product['name']} {qty:+.1f}（即時庫存：{new_stock}）")
-                    if dup_resp:
-                        st.warning(f"⚠️ 注意：今天 {tx_date} 此品項已有 {len(dup_resp)} 筆紀錄。請確認是否重複登錄，可至「歷史紀錄」修改/刪除。")
-                except Exception as e:
-                    st.error(f"登錄失敗：{e}")
+                if dup_resp:
+                    existing = ", ".join(f"{float(t['change_qty']):+.1f}" for t in dup_resp)
+                    st.error(
+                        f"❌ 拒絕登錄：{tx_date} 已有 **{product['name']}** 的進貨紀錄"
+                        f"（{len(dup_resp)} 筆，數量：{existing}）。\n\n"
+                        f"請切換到上方「📜 歷史紀錄」分頁，找到該筆修改數量；"
+                        f"或先刪除後再重新登錄。"
+                    )
+                else:
+                    try:
+                        full_note = f"[{tx_brand}] {note}".strip() if tx_brand != "-" else (note or None)
+                        sb.table("transactions").insert({
+                            "product_id": product["id"], "clinic_id": clinic_id,
+                            "change_qty": qty, "tx_date": str(tx_date),
+                            "tx_type": tx_type, "note": full_note, "created_by": user["id"],
+                        }).execute()
+
+                        recalc_consumed_for_product(int(product["id"]), int(clinic_id))
+                        new_stock = sb.table("clinic_stock").select("current_stock").eq(
+                            "product_id", product["id"]).eq("clinic_id", clinic_id).execute().data[0]["current_stock"]
+                        st.success(f"已登錄：{product['name']} {qty:+.1f}（即時庫存：{new_stock}）")
+                    except Exception as e:
+                        st.error(f"登錄失敗：{e}")
 
     with tab_history:
         sb = get_supabase_client()
