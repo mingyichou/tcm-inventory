@@ -1516,6 +1516,24 @@ def page_inventory():
             key="photo_upload",
         )
 
+        # 模型選項與雙重檢視
+        col_m1, col_m2 = st.columns([1, 1])
+        with col_m1:
+            photo_model_choice = st.selectbox(
+                "AI 模型",
+                ["gemini-2.5-pro（準確，建議）", "gemini-2.5-flash（快、省）"],
+                index=0,
+                key="photo_model_choice",
+                help="Pro 比 Flash 在手寫數字辨識上準確很多。每張成本約 $0.01–0.03 美元。",
+            )
+        with col_m2:
+            photo_double_check = st.toggle(
+                "🔍 雙重檢視（每張跑兩次比對）",
+                value=True,
+                key="photo_double_check",
+                help="第一次辨識後再請 AI 對照原圖核對，找出錯誤並修正。慢一倍、貴一倍，但準確度顯著提升。",
+            )
+
         if uploaded_files and len(uploaded_files) > 20:
             st.error("最多上傳 20 張照片")
             uploaded_files = uploaded_files[:20]
@@ -1531,45 +1549,127 @@ def page_inventory():
                 import json as json_mod
                 client = genai.Client(api_key=st.secrets["gemini"]["api_key"])
 
-                PROMPT = """【任務目標】
-你是一個精準的數據擷取機器人。請從這張手寫盤點表圖檔中提取數據。
+                model_id = "gemini-2.5-pro" if "pro" in photo_model_choice else "gemini-2.5-flash"
 
-【定位與擷取規則】
-1. 找到「品項」直行，往下擷取所有藥品名稱（以印刷體為準）。
-2. 找到表格最右側標題「日期:」欄位，裡面可能有手寫日期（如 3/25、4/8）。
-3. 擷取「日期:」下方每個品項對應的手寫盤點數量。
-4. 數字配對規則：
-   - 「3+7」等加法請加總（=10）
-   - 含小數點的數字照實輸出，如「0.5」→ 0.5、「1.7」→ 1.7
-   - 空白、斜線「/」、撇號「-」= null
-   - 「K」或「k」= null
-   - 有刪除線再重寫的，以最後寫的為準
-5. 日期如果看不清或沒寫，date 輸出 null。
+                PROMPT_EXTRACT = """你是高精度盤點數據抽取機器人。任務：從手寫盤點表照片，提取每個藥品對應的【最右欄手寫數量】。
+
+【表格結構說明】
+從左至右大致為：注音首字 / 品項（印刷體藥名）/ 櫃位 / 廠1 / 廠2 / 多個歷史盤點與進貨欄（已印好的數字）/ 「日期:」欄（最右側，本次手寫盤點數量）
+
+【提取目標】
+只看「日期:」欄（最右欄）的手寫數字，與「品項」欄的印刷藥名配對。其他欄位的數字（歷史盤點、進貨）一律忽略。
+
+【嚴謹處理流程，請逐步思考】
+
+步驟 1 — 定位「日期:」欄：表格最右側，標題寫「日期:」（其後可能有手寫日期）。
+
+步驟 2 — 對每一列藥品依序處理：
+  a) 讀取「品項」欄的印刷體藥名（例：加味逍遙散）
+  b) 讀取「日期:」欄該列的手寫字符
+  c) 將原始字符照抄到 raw 欄位（包括 +、-、.、刪除線等記號）
+  d) 計算最終數量 qty
+
+步驟 3 — qty 計算規則：
+  - 加法：「3+7」→ 10、「2+1+0.5」→ 3.5、「8+7」→ 15
+  - 小數：「0.5」→ 0.5、「1.7」→ 1.7（注意小數點不要漏看）
+  - 修正/刪除線：取最後寫的數字
+  - 整數：直接照抄
+
+步驟 4 — qty = null 的情況（嚴格區分）：
+  - 完全空白 → null（不要寫 0）
+  - 「/」（單獨斜線）→ null
+  - 「-」（單獨破折號）→ null
+  - 「K」「k」→ null
+  - 「？」「?」「不確定」→ null
+  - 寫了字但無法判讀 → null
+
+步驟 5 — 自我檢查（內部執行，不輸出）：
+  逐筆重新對照原圖檢查，特別注意這些常見錯誤：
+  ✓ 加法是否算對？把 raw 中的數字再算一次
+  ✓ 是否漏看小數點？「3.5」可能誤看為「35」
+  ✓ 手寫常混淆：1 vs 7、0 vs 6 vs 9、3 vs 5 vs 8、4 vs 9 — 多看兩眼
+  ✓ 對齊：手寫數字真的對應到該列藥品嗎？
+  ✓ 空白 ≠ 0：空白應為 null
+  ✓ 漏列：是否每個藥品都處理到了？
+
+步驟 6 — 辨識日期（最右欄表頭「日期:」後的手寫日期，如 3/25、4/8）。看不清就 null。
 
 【輸出格式】
-嚴格 JSON，不要任何解釋文字：
-{"date": "4/8", "items": [{"name": "加味逍遙散", "qty": 15}, {"name": "附子", "qty": 0.5}, {"name": "葛根湯", "qty": null}]}"""
+嚴格 JSON，無任何解釋、無 markdown 標記：
+{"date":"4/8","items":[{"name":"加味逍遙散","raw":"8+7","qty":15},{"name":"附子","raw":"0.5","qty":0.5},{"name":"葛根湯","raw":"/","qty":null}]}
 
-                all_items = []
+每筆必須有 name、raw、qty 三個欄位。raw 是你看到的手寫原始字符（用於人工核對），qty 是最終數量。"""
+
+                PROMPT_VERIFY = """以下是 AI 第一次辨識的結果。請對照原圖，**逐筆重新核對**每一個 raw 與 qty，找出辨識錯誤並修正。
+
+【第一次辨識結果】
+%s
+
+【核對重點】
+1. 對每一筆 item，重新看原圖該列的手寫字符
+2. 確認 raw 是否正確（手寫原貌）
+3. 確認 qty 是否與 raw 計算一致（加法、小數點）
+4. 找出可能誤判的字（1/7、0/6、3/5/8、4/9）
+5. 確認沒有漏列
+
+【輸出格式】
+嚴格 JSON，包含**所有**藥品（不只修正的，全部都要）。修正過的條目維持同樣 schema，但用更新後的 raw 與 qty：
+{"date":"4/8","items":[{"name":"加味逍遙散","raw":"8+7","qty":15},...]}
+
+不要加 markdown、不要加解釋。"""
+
+                all_items = []  # 最終結果（含 raw）
                 detected_dates = []
+                total_passes = (1 + (1 if photo_double_check else 0)) * len(uploaded_files)
+                pass_done = 0
                 progress = st.progress(0, text="辨識中...")
 
                 for i, f in enumerate(uploaded_files):
-                    progress.progress((i + 1) / len(uploaded_files),
-                                      text=f"辨識第 {i+1}/{len(uploaded_files)} 張...")
                     img_bytes = f.read()
+                    mime = f.type or "image/jpeg"
+
+                    # ── 第一遍 ──
+                    pass_done += 1
+                    progress.progress(
+                        pass_done / total_passes,
+                        text=f"第 {i+1}/{len(uploaded_files)} 張 — 第 1 次辨識中…",
+                    )
                     response = client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model=model_id,
                         contents=[
-                            genai.types.Part.from_bytes(
-                                data=img_bytes, mime_type=f.type or "image/jpeg"),
-                            PROMPT,
+                            genai.types.Part.from_bytes(data=img_bytes, mime_type=mime),
+                            PROMPT_EXTRACT,
                         ],
                     )
                     text = response.text.strip()
                     if text.startswith("```"):
                         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
                     result = json_mod.loads(text)
+
+                    # ── 第二遍（若啟用雙重檢視）──
+                    if photo_double_check:
+                        pass_done += 1
+                        progress.progress(
+                            pass_done / total_passes,
+                            text=f"第 {i+1}/{len(uploaded_files)} 張 — 第 2 次核對中…",
+                        )
+                        try:
+                            verify_resp = client.models.generate_content(
+                                model=model_id,
+                                contents=[
+                                    genai.types.Part.from_bytes(data=img_bytes, mime_type=mime),
+                                    PROMPT_VERIFY % json_mod.dumps(result, ensure_ascii=False),
+                                ],
+                            )
+                            v_text = verify_resp.text.strip()
+                            if v_text.startswith("```"):
+                                v_text = v_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+                            verified = json_mod.loads(v_text)
+                            # 用第二次結果覆蓋
+                            result = verified
+                        except Exception as ve:
+                            st.warning(f"第 {i+1} 張第二次核對失敗，沿用第一次結果：{ve}")
+
                     if result.get("date"):
                         detected_dates.append(result["date"])
                     for item in result.get("items", []):
@@ -1606,24 +1706,29 @@ def page_inventory():
                 active_pids = {s["product_id"] for s in cs_photo if s.get("is_active", True)}
                 stock_map_photo = {s["product_id"]: float(s["current_stock"]) for s in cs_photo}
 
-                # 去重
+                # 去重（保留 raw 給人工核對）
                 item_map = {}
                 for item in all_items:
                     name = item["name"].strip()
-                    item_map[name] = item.get("qty")
+                    item_map[name] = (item.get("qty"), item.get("raw", "") or "")
 
                 matched, unmatched = [], []
-                for name, qty in item_map.items():
+                for name, (qty, raw) in item_map.items():
                     pid = name_to_pid.get(name) or name_to_pid.get(name.replace(" ", ""))
                     if pid and pid in active_pids:
                         matched.append({
                             "product_id": int(pid),
                             "品項": next(p["name"] for p in all_products_db if p["id"] == pid),
+                            "AI看到": str(raw),
                             "辨識數量": round(float(qty), 1) if qty is not None else None,
                             "帳面庫存": stock_map_photo.get(pid, 0),
                         })
                     else:
-                        unmatched.append({"品項(未匹配)": name, "辨識數量": qty})
+                        unmatched.append({
+                            "品項(未匹配)": name,
+                            "AI看到": str(raw),
+                            "辨識數量": qty,
+                        })
 
                 # 存入 session_state
                 st.session_state.photo_results = {
@@ -1678,11 +1783,14 @@ def page_inventory():
                 match_df = pd.DataFrame(matched)
 
                 st.subheader(f"📋 預覽辨識結果（日期：{final_date}）")
+                st.caption("「AI 看到」是 AI 從照片讀到的原始字符，方便你比對手寫實際內容是否被正確解讀。")
                 edited_match = st.data_editor(
-                    match_df[["品項", "帳面庫存", "辨識數量"]],
+                    match_df[["品項", "AI看到", "帳面庫存", "辨識數量"]],
                     use_container_width=True, hide_index=True,
                     column_config={
                         "品項": st.column_config.TextColumn(disabled=True),
+                        "AI看到": st.column_config.TextColumn("AI 看到", disabled=True,
+                                                              help="AI 從照片讀到的原始手寫字符"),
                         "帳面庫存": st.column_config.NumberColumn(disabled=True, format="%.1f"),
                         "辨識數量": st.column_config.NumberColumn("盤點數量 ✏️", min_value=0, format="%.1f"),
                     },
