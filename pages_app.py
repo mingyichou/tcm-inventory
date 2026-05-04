@@ -9,7 +9,7 @@ import pandas as pd
 from datetime import date, datetime, timedelta
 from collections import defaultdict
 from pypinyin import pinyin, Style
-from database import get_supabase_client
+from database import get_supabase_client, fetch_all
 
 
 # ══════════════════════════════════════════════
@@ -290,9 +290,9 @@ def recalc_consumed_for_product(product_id: int, clinic_id: int):
 def recalc_all_consumed_in_clinic(clinic_id: int) -> int:
     """重算指定診所所有品項的 inventory_logs。回傳處理品項數。"""
     sb = get_supabase_client()
-    pids = sb.table("inventory_logs").select(
+    pids = fetch_all(sb.table("inventory_logs").select(
         "product_id"
-    ).eq("clinic_id", clinic_id).execute().data
+    ).eq("clinic_id", clinic_id))
     pid_set = {p["product_id"] for p in pids}
     for pid in pid_set:
         recalc_consumed_for_product(int(pid), int(clinic_id))
@@ -662,9 +662,9 @@ def page_stock_overview():
     stock_multiplier = float(next(s["value"] for s in settings if s["key"] == "stock_target_multiplier"))
 
     # 載入盤點紀錄
-    all_logs = sb.table("inventory_logs").select(
+    all_logs = fetch_all(sb.table("inventory_logs").select(
         "product_id, current_count_qty, consumed_qty, log_date, session_id"
-    ).eq("clinic_id", clinic_id).order("log_date", desc=True).execute().data
+    ).eq("clinic_id", clinic_id).order("log_date", desc=True))
 
     # 計算每品項平均耗用（近 6 次，負數當 0，含 0 算分母）
     consumed_recent_map = build_recent_consumed_map(all_logs, n=6)
@@ -705,9 +705,9 @@ def page_stock_overview():
             product_log_map[pid][d] = log
 
     # 進退貨
-    all_tx = sb.table("transactions").select(
+    all_tx = fetch_all(sb.table("transactions").select(
         "product_id, change_qty, tx_date"
-    ).eq("clinic_id", clinic_id).order("tx_date").execute().data
+    ).eq("clinic_id", clinic_id).order("tx_date"))
     tx_by_product = defaultdict(list)
     for tx in all_tx:
         tx_by_product[tx["product_id"]].append(tx)
@@ -1060,9 +1060,9 @@ def page_transactions():
         # 重複進貨偵測（同診所、同品項、同日期 ≥ 2 筆）
         with st.expander("⚠️ 重複進貨偵測（同日期同品項 ≥ 2 筆）"):
             st.caption(f"範圍：{selected_clinic} 的所有 transactions（不受上方時間/類型/搜尋篩選影響）")
-            all_tx_for_dup = sb.table("transactions").select(
+            all_tx_for_dup = fetch_all(sb.table("transactions").select(
                 "id, tx_date, change_qty, tx_type, note, product_id, products(name)"
-            ).eq("clinic_id", clinic_id).order("tx_date", desc=True).execute().data
+            ).eq("clinic_id", clinic_id).order("tx_date", desc=True))
             dup_groups = defaultdict(list)
             for t in all_tx_for_dup:
                 dup_groups[(t["tx_date"], t["product_id"])].append(t)
@@ -1220,9 +1220,9 @@ def page_inventory():
         brand_map_print = {b["id"]: b["name"] for b in brands_data}
 
         # 載入歷史盤點
-        print_logs = sb.table("inventory_logs").select(
+        print_logs = fetch_all(sb.table("inventory_logs").select(
             "product_id, current_count_qty, log_date"
-        ).eq("clinic_id", clinic_id).order("log_date", desc=True).execute().data
+        ).eq("clinic_id", clinic_id).order("log_date", desc=True))
 
         # 最近 3 個盤點日期
         p_dates = []
@@ -1242,9 +1242,9 @@ def page_inventory():
                 p_log_map[pid][d] = lg
 
         # 進退貨
-        print_tx = sb.table("transactions").select(
+        print_tx = fetch_all(sb.table("transactions").select(
             "product_id, change_qty, tx_date"
-        ).eq("clinic_id", clinic_id).execute().data
+        ).eq("clinic_id", clinic_id))
         tx_by_p = defaultdict(list)
         for tx in print_tx:
             tx_by_p[tx["product_id"]].append(tx)
@@ -1983,9 +1983,9 @@ def page_inventory():
                     else:
                         try:
                             # 取得每個品項的最新盤點
-                            last_logs = sb.table("inventory_logs").select(
+                            last_logs = fetch_all(sb.table("inventory_logs").select(
                                 "product_id, current_count_qty, log_date"
-                            ).eq("clinic_id", clinic_id).order("log_date", desc=True).execute().data
+                            ).eq("clinic_id", clinic_id).order("log_date", desc=True))
 
                             last_count_map, last_date_map = {}, {}
                             for log in last_logs:
@@ -1994,9 +1994,9 @@ def page_inventory():
                                     last_count_map[pid] = float(log["current_count_qty"])
                                     last_date_map[pid] = log["log_date"]
 
-                            all_tx = sb.table("transactions").select(
+                            all_tx = fetch_all(sb.table("transactions").select(
                                 "product_id, change_qty, tx_date"
-                            ).eq("clinic_id", clinic_id).execute().data
+                            ).eq("clinic_id", clinic_id))
 
                             tx_by_pid = defaultdict(list)
                             for tx in all_tx:
@@ -2135,19 +2135,19 @@ def page_inventory():
                     with col_save:
                         if st.button("💾 儲存修改", key=f"hist_save_{s['id']}", type="primary"):
                             # 載入進貨資料
-                            all_tx = sb.table("transactions").select(
+                            all_tx = fetch_all(sb.table("transactions").select(
                                 "product_id, change_qty, tx_date"
-                            ).eq("clinic_id", clinic_id).execute().data
+                            ).eq("clinic_id", clinic_id))
                             tx_by_pid = defaultdict(list)
                             for tx in all_tx:
                                 tx_by_pid[tx["product_id"]].append(tx)
 
                             # 載入每品項最新盤點（排除當前 session）
-                            prev_logs = sb.table("inventory_logs").select(
+                            prev_logs = fetch_all(sb.table("inventory_logs").select(
                                 "product_id, current_count_qty, log_date"
                             ).eq("clinic_id", clinic_id).neq(
                                 "session_id", s["id"]
-                            ).order("log_date", desc=True).execute().data
+                            ).order("log_date", desc=True))
                             prev_map = {}
                             prev_date_map = {}
                             for pl in prev_logs:
@@ -2475,13 +2475,13 @@ def page_analytics():
     product_info = {}
     has_any = False
     for cid in clinic_ids:
-        resp = sb.table("inventory_logs").select(
+        clinic_logs = fetch_all(sb.table("inventory_logs").select(
             "product_id, consumed_qty, log_date, products(name, category_id, categories(name), units(name))"
-        ).eq("clinic_id", cid).order("log_date", desc=True).execute()
-        if resp.data:
+        ).eq("clinic_id", cid).order("log_date", desc=True))
+        if clinic_logs:
             has_any = True
-        consumed_per_clinic[cid] = build_recent_consumed_map(resp.data, n=6)
-        for log in resp.data:
+        consumed_per_clinic[cid] = build_recent_consumed_map(clinic_logs, n=6)
+        for log in clinic_logs:
             pid = log["product_id"]
             if pid not in product_info:
                 product_info[pid] = {
@@ -2789,9 +2789,9 @@ def page_order():
     ).execute().data
     products = sort_products_by_bopomofo(products, cs_map=cs_map)
 
-    logs = sb.table("inventory_logs").select(
+    logs = fetch_all(sb.table("inventory_logs").select(
         "product_id, consumed_qty, log_date"
-    ).eq("clinic_id", clinic_id).order("log_date", desc=True).execute().data
+    ).eq("clinic_id", clinic_id).order("log_date", desc=True))
     consumed_data = build_recent_consumed_map(logs, n=6)
 
     st.subheader("步驟一：編輯叫貨清單")
