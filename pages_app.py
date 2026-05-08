@@ -1466,21 +1466,50 @@ def page_inventory():
                         for ci, (_, _, key) in enumerate(pcols, 1):
                             if key == "_initial": val = show_init
                             elif key == "_name": val = p["name"]
-                            elif key == "_cabinet": val = cs.get("cabinet") or ""
-                            elif key == "_b1": val = abbr_brand(brand_map_print.get(cs.get("brand1_id"), "-"))
-                            elif key == "_b2": val = abbr_brand(brand_map_print.get(cs.get("brand2_id"), "-"))
+                            elif key == "_cabinet": val = cs.get("cabinet") or " "
+                            elif key == "_b1":
+                                bid = cs.get("brand1_id")
+                                val = abbr_brand(brand_map_print.get(bid, "-")) if bid else " "
+                            elif key == "_b2":
+                                bid = cs.get("brand2_id")
+                                val = abbr_brand(brand_map_print.get(bid, "-")) if bid else " "
                             elif key and key.startswith("_inv_"):
                                 d = key[5:]
                                 lg = p_logs_data.get(d)
                                 val = round(float(lg["current_count_qty"]), 1) if lg else ""
-                            elif key and key.startswith("_restock_") or key and key.startswith("_consume_") or key == "_new":
+                            elif key and key.startswith("_restock_"):
+                                d = key[9:]
+                                idx = p_display.index(d) if d in p_display else -1
+                                if idx < len(p_display) - 1:
+                                    next_d = p_display[idx + 1]
+                                    val = round(sum(float(t["change_qty"]) for t in tx_by_p.get(pid, [])
+                                                    if d < t["tx_date"] <= next_d), 1)
+                                else:
+                                    val = round(sum(float(t["change_qty"]) for t in tx_by_p.get(pid, [])
+                                                    if t["tx_date"] > d), 1)
+                            elif key and key.startswith("_consume_"):
+                                d = key[9:]
+                                idx = p_display.index(d) if d in p_display else -1
+                                lg_this = p_logs_data.get(d)
+                                if idx < len(p_display) - 1:
+                                    next_d = p_display[idx + 1]
+                                    lg_next = p_logs_data.get(next_d)
+                                    restock = sum(float(t["change_qty"]) for t in tx_by_p.get(pid, [])
+                                                  if d < t["tx_date"] <= next_d)
+                                    if lg_this and lg_next:
+                                        val = round(float(lg_this["current_count_qty"]) + restock - float(lg_next["current_count_qty"]), 1)
+                                    else:
+                                        val = ""
+                                else:
+                                    val = ""
+                            elif key == "_new":
                                 val = ""
                             else:
                                 val = ""
                             cell = ws.cell(row=row_num, column=ci, value=val)
                             cell.alignment = lft if key == "_name" else ctr
                             cell.border = border_thin
-                            if key == "_cabinet" and isinstance(val, str) and val and val[0] in ("C", "c"):
+                            if key == "_cabinet" and isinstance(val, str) and val and val.strip() and val[0] in ("C", "c"):
                                 cell.font = red_font
                                 cell.fill = red_fill
                             elif key.startswith("_inv_"):
@@ -1551,9 +1580,41 @@ def page_inventory():
 
                 model_id = "gemini-2.5-pro" if "pro" in photo_model_choice else "gemini-2.5-flash"
 
-                PROMPT_EXTRACT = """你是高精度盤點數據抽取機器人。任務：從手寫盤點表照片，提取每個藥品對應的【最右欄手寫數量】。
+                # 撈該診所所有 active 品項，組成 prompt 中的可用清單
+                prompt_prods_db = sb.table("products").select(
+                    "id, name, category_id, categories(name)"
+                ).execute().data
+                prompt_cs = sb.table("clinic_stock").select(
+                    "product_id, is_active"
+                ).eq("clinic_id", clinic_id).execute().data
+                prompt_active_pids = {s["product_id"] for s in prompt_cs if s.get("is_active", True)}
+                prompt_active_prods = [p for p in prompt_prods_db if p["id"] in prompt_active_pids]
+                prompt_active_prods = sort_products_by_bopomofo(prompt_active_prods)
+                _list_by_cat = defaultdict(list)
+                for p in prompt_active_prods:
+                    cat = (p.get("categories") or {}).get("name") or "其他"
+                    initial = get_bopomofo_initial(p["name"]) or " "
+                    _list_by_cat[cat].append(f"  {initial} {p['name']}")
+                product_list_lines = []
+                for cat, lines in _list_by_cat.items():
+                    product_list_lines.append(f"【{cat}】")
+                    product_list_lines.extend(lines)
+                product_list_text = "\n".join(product_list_lines)
 
-【表格結構說明】
+                PROMPT_EXTRACT = ("""你是高精度盤點數據抽取機器人。任務：從手寫盤點表照片，提取每個藥品對應的【最右欄手寫數量】。
+
+【可用品項清單】（這份盤點表上的藥品全部來自此清單，前綴為注音首字）
+""" + product_list_text + """
+
+【name 欄位規則 — 非常重要】
+- name 必須**逐字照抄**自上述清單，不可自行改字、補字、刪字、合併、拆分
+- 若品項欄印刷字被遮擋、模糊、或截斷（例如照片只看到「桂枝芍藥知...」），請從清單中找**前綴或部分字符唯一匹配**的完整 name 並使用該完整 name
+  範例：照片只讀到「桂枝芍藥知」→ 清單裡只有一個「桂枝芍藥知母湯」匹配 → name 填「桂枝芍藥知母湯」
+- 若多個品名都能匹配前綴（如「四物湯」與「四物湯加味」皆以「四物湯」開頭），在 raw 加上「[截斷不確定]」標記，name 仍盡力選擇最像的一個
+- 若清單中找不到任何匹配（陌生藥名），照原樣抄寫圖中讀到的字，並在 raw 前加「[未匹配]」標記
+
+【表格結構說明】""")
+                PROMPT_EXTRACT += """
 從左至右大致為：注音首字 / 品項（印刷體藥名）/ 櫃位 / 廠1 / 廠2 / 多個歷史盤點與進貨欄（已印好的數字）/ 「日期:」欄（最右側，本次手寫盤點數量）
 
 【提取目標】
@@ -1600,23 +1661,27 @@ def page_inventory():
 
 每筆必須有 name、raw、qty 三個欄位。raw 是你看到的手寫原始字符（用於人工核對），qty 是最終數量。"""
 
-                PROMPT_VERIFY = """以下是 AI 第一次辨識的結果。請對照原圖，**逐筆重新核對**每一個 raw 與 qty，找出辨識錯誤並修正。
+                PROMPT_VERIFY = ("""以下是 AI 第一次辨識的結果。請對照原圖，**逐筆重新核對**每一個 name、raw 與 qty，找出辨識錯誤並修正。
+
+【可用品項清單】（每個 name 必須是清單中的完整品名；若 name 是截斷字串如「桂枝芍藥知...」請從清單補全）
+""" + product_list_text + """
 
 【第一次辨識結果】
-%s
+__VERIFY_RESULT__
 
 【核對重點】
 1. 對每一筆 item，重新看原圖該列的手寫字符
-2. 確認 raw 是否正確（手寫原貌）
-3. 確認 qty 是否與 raw 計算一致（加法、小數點）
-4. 找出可能誤判的字（1/7、0/6、3/5/8、4/9）
-5. 確認沒有漏列
+2. 確認 name 是否為清單中的完整品名（截斷的字補全；陌生品名前綴加「[未匹配]」標記到 raw）
+3. 確認 raw 是否正確（手寫原貌）
+4. 確認 qty 是否與 raw 計算一致（加法、小數點)
+5. 找出可能誤判的字（1/7、0/6、3/5/8、4/9）
+6. 確認沒有漏列
 
 【輸出格式】
-嚴格 JSON，包含**所有**藥品（不只修正的，全部都要）。修正過的條目維持同樣 schema，但用更新後的 raw 與 qty：
+嚴格 JSON，包含**所有**藥品（不只修正的，全部都要）。修正過的條目維持同樣 schema，但用更新後的 name、raw 與 qty：
 {"date":"4/8","items":[{"name":"加味逍遙散","raw":"8+7","qty":15},...]}
 
-不要加 markdown、不要加解釋。"""
+不要加 markdown、不要加解釋。""")
 
                 all_items = []  # 最終結果（含 raw）
                 detected_dates = []
@@ -1658,7 +1723,7 @@ def page_inventory():
                                 model=model_id,
                                 contents=[
                                     genai.types.Part.from_bytes(data=img_bytes, mime_type=mime),
-                                    PROMPT_VERIFY % json_mod.dumps(result, ensure_ascii=False),
+                                    PROMPT_VERIFY.replace("__VERIFY_RESULT__", json_mod.dumps(result, ensure_ascii=False)),
                                 ],
                             )
                             v_text = verify_resp.text.strip()
@@ -1706,6 +1771,30 @@ def page_inventory():
                 active_pids = {s["product_id"] for s in cs_photo if s.get("is_active", True)}
                 stock_map_photo = {s["product_id"]: float(s["current_stock"]) for s in cs_photo}
 
+                # active 品項的 name → pid 對照（給 fuzzy 前綴匹配用）
+                active_name_pid = [(p["name"], p["id"]) for p in all_products_db
+                                   if p["id"] in active_pids]
+
+                def fuzzy_match_pid(query_name: str):
+                    """fallback：去掉省略號/標記後，用前 5 字（或更短）做唯一前綴匹配"""
+                    cleaned = query_name.replace("...", "").replace("…", "").strip()
+                    for marker in ("[未匹配]", "[截斷不確定]"):
+                        if cleaned.startswith(marker):
+                            cleaned = cleaned[len(marker):].strip()
+                    if not cleaned:
+                        return None
+                    prefix = cleaned[:5]
+                    candidates = [pid for nm, pid in active_name_pid if nm.startswith(prefix)]
+                    if len(candidates) == 1:
+                        return candidates[0]
+                    # 嘗試更短前綴：3 字（避免誤配）
+                    if len(cleaned) >= 3:
+                        prefix3 = cleaned[:3]
+                        candidates3 = [pid for nm, pid in active_name_pid if nm.startswith(prefix3)]
+                        if len(candidates3) == 1:
+                            return candidates3[0]
+                    return None
+
                 # 去重（保留 raw 給人工核對）
                 item_map = {}
                 for item in all_items:
@@ -1715,6 +1804,9 @@ def page_inventory():
                 matched, unmatched = [], []
                 for name, (qty, raw) in item_map.items():
                     pid = name_to_pid.get(name) or name_to_pid.get(name.replace(" ", ""))
+                    if not (pid and pid in active_pids):
+                        # fallback：前綴 fuzzy
+                        pid = fuzzy_match_pid(name)
                     if pid and pid in active_pids:
                         matched.append({
                             "product_id": int(pid),
@@ -1730,6 +1822,26 @@ def page_inventory():
                             "辨識數量": qty,
                         })
 
+                # 寫入辨識報告（含失敗名單，供日後糾錯）
+                report_id = None
+                try:
+                    report_resp = sb.table("photo_recognition_reports").insert({
+                        "clinic_id": int(clinic_id),
+                        "operator_id": int(user["id"]),
+                        "session_date": ai_date,
+                        "photo_count": len(uploaded_files),
+                        "item_count": len(all_items),
+                        "matched_count": len(matched),
+                        "unmatched_count": len(unmatched),
+                        "unmatched_items": unmatched,
+                        "ai_model": model_id,
+                        "double_check": bool(photo_double_check),
+                        "saved": False,
+                    }).execute()
+                    report_id = report_resp.data[0]["id"] if report_resp.data else None
+                except Exception as re:
+                    st.warning(f"報告記錄失敗（不影響辨識結果）：{re}")
+
                 # 存入 session_state
                 st.session_state.photo_results = {
                     "matched": matched,
@@ -1738,6 +1850,7 @@ def page_inventory():
                     "parsed_ai_dates": sorted(parsed_ai_dates) if parsed_ai_dates else [],
                     "photo_count": len(uploaded_files),
                     "item_count": len(all_items),
+                    "report_id": report_id,
                 }
                 st.rerun()
 
@@ -1887,6 +2000,20 @@ def page_inventory():
                                 for pid in affected_pids:
                                     recalc_consumed_for_product(pid, int(clinic_id))
 
+                                # 更新辨識報告 saved 狀態
+                                rid = results.get("report_id") if results else None
+                                if rid:
+                                    try:
+                                        sb.table("photo_recognition_reports").update({
+                                            "saved": True,
+                                            "saved_at": datetime.now().isoformat(),
+                                            "saved_inserted": int(inserted),
+                                            "saved_updated": int(updated),
+                                            "session_date": final_date,
+                                        }).eq("id", rid).execute()
+                                    except Exception:
+                                        pass
+
                                 st.session_state.photo_results = None
                                 msg = []
                                 if inserted > 0:
@@ -1903,6 +2030,54 @@ def page_inventory():
                     if st.button("🗑️ 清除結果", key="photo_clear"):
                         st.session_state.photo_results = None
                         st.rerun()
+
+        # ── 辨識報告歷史 ──
+        st.divider()
+        with st.expander("📊 辨識報告歷史（成功/失敗統計與失敗名單）", expanded=False):
+            try:
+                reports = sb.table("photo_recognition_reports").select(
+                    "id, recognized_at, session_date, photo_count, item_count, "
+                    "matched_count, unmatched_count, unmatched_items, ai_model, "
+                    "double_check, saved, saved_at, saved_inserted, saved_updated"
+                ).eq("clinic_id", clinic_id).order(
+                    "recognized_at", desc=True
+                ).limit(30).execute().data
+            except Exception as e:
+                reports = None
+                st.info(f"尚未建立報告表，請先在 Supabase SQL Editor 執行 migration_v3_photo_reports.sql。錯誤：{e}")
+
+            if reports is not None:
+                if not reports:
+                    st.caption("目前沒有辨識報告。執行一次拍照盤點後就會出現紀錄。")
+                else:
+                    for rpt in reports:
+                        rec_at = rpt["recognized_at"]
+                        try:
+                            rec_dt = datetime.fromisoformat(rec_at.replace("Z", "+00:00"))
+                            ts = rec_dt.strftime("%Y/%m/%d %H:%M")
+                        except Exception:
+                            ts = rec_at
+                        saved_tag = "✅ 已存檔" if rpt.get("saved") else "⚠️ 未存檔"
+                        sd = rpt.get("session_date") or "-"
+                        title = (
+                            f"{ts} ｜ {saved_tag} ｜ 盤點日 {sd} ｜ "
+                            f"{rpt['photo_count']} 張 ｜ 成功 {rpt['matched_count']} / 失敗 {rpt['unmatched_count']}"
+                        )
+                        with st.container(border=True):
+                            st.markdown(f"**{title}**")
+                            meta = []
+                            meta.append(f"模型：{rpt.get('ai_model') or '-'}")
+                            meta.append("雙重檢視：開" if rpt.get("double_check") else "雙重檢視：關")
+                            if rpt.get("saved"):
+                                meta.append(f"新增 {rpt.get('saved_inserted') or 0} 筆")
+                                meta.append(f"更新 {rpt.get('saved_updated') or 0} 筆")
+                            st.caption(" ｜ ".join(meta))
+                            unmatched_list = rpt.get("unmatched_items") or []
+                            if unmatched_list:
+                                df_un = pd.DataFrame(unmatched_list)
+                                st.dataframe(df_un, use_container_width=True, hide_index=True)
+                            else:
+                                st.caption("無失敗項目")
 
     # ── 執行盤點 ──
     with tab_do:
