@@ -831,7 +831,7 @@ def page_stock_overview():
 
     # ── 主表格（data_editor）──
     inv_col_names = [c[0] for c in inv_col_specs]
-    visible_cols = ["品項", "廠牌1", "即時庫存", "平均耗用", "狀態"] + inv_col_names + ["建議叫貨", "叫貨", "分類", "櫃位", "廠牌2"]
+    visible_cols = ["品項", "廠牌1", "即時庫存", "平均耗用"] + inv_col_names + ["建議叫貨", "叫貨", "狀態", "分類", "櫃位", "廠牌2"]
     df_display_ordered = df_display[visible_cols]
 
     col_config = {
@@ -843,7 +843,7 @@ def page_stock_overview():
         "櫃位": st.column_config.TextColumn(disabled=True, width="small"),
         "廠牌2": st.column_config.TextColumn(disabled=True, width="small"),
         "平均耗用": st.column_config.NumberColumn(disabled=True, format="%.1f", pinned="left", width="small"),
-        "狀態": st.column_config.TextColumn("狀態", disabled=True, width="small",
+        "狀態": st.column_config.TextColumn("狀態", disabled=True, width=60,
                                           help="🔴 = 最近一次耗用異常（為負數，或超過平均耗用×該分類閾值）"),
         "建議叫貨": st.column_config.NumberColumn(disabled=True, format="%.1f", width="small"),
         "叫貨": st.column_config.NumberColumn("叫貨 ✏️", min_value=0, format="%.1f", width="small"),
