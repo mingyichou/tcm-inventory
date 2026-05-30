@@ -795,11 +795,12 @@ def page_stock_overview():
         else:
             suggested = 0
 
-        # 異常狀態：最近一次耗用為負數，或 最近一次耗用 > 平均耗用 × 分類閾值
+        # 異常狀態：(1) 最近一次耗用為負數；或
+        #          (2) 最近一次耗用 > 平均耗用×分類閾值 且 耗用 > 1
         latest_consumed = recent_consumed[0] if recent_consumed else None
         is_abnormal = latest_consumed is not None and (
             latest_consumed < 0
-            or (avg_c > 0 and latest_consumed > avg_c * params["threshold"])
+            or (avg_c > 0 and latest_consumed > avg_c * params["threshold"] and latest_consumed > 1)
         )
 
         row["即時庫存"] = current_stock
