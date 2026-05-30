@@ -189,7 +189,10 @@ def load_brands():
 @st.cache_data(ttl=30)
 def load_categories():
     sb = get_supabase_client()
-    return sb.table("categories").select("id, name, default_unit_id, default_spec_note").order("id").execute().data
+    return sb.table("categories").select(
+        "id, name, default_unit_id, default_spec_note, "
+        "stock_target_multiplier, anomaly_threshold, safety_factor"
+    ).order("id").execute().data
 
 @st.cache_data(ttl=30)
 def load_units():
@@ -326,6 +329,25 @@ def build_recent_consumed_map(logs_desc: list, n: int = 6) -> dict:
             for log in recent
         ]
     return result
+
+
+# 分類參數預設值（migration_v4 之前的全域值）
+DEFAULT_CAT_PARAMS = {"multiplier": 2.0, "threshold": 1.5, "safety": 1.2}
+
+
+def build_category_params(categories: list) -> dict:
+    """{分類名稱: {"multiplier","threshold","safety"}}；缺值套用全域預設。
+    multiplier=目標庫存備貨倍數、threshold=異常耗用警示閾值、safety=建議叫貨安全係數。"""
+    def _f(v, d):
+        return float(v) if v not in (None, "") else d
+    return {
+        c["name"]: {
+            "multiplier": _f(c.get("stock_target_multiplier"), DEFAULT_CAT_PARAMS["multiplier"]),
+            "threshold": _f(c.get("anomaly_threshold"), DEFAULT_CAT_PARAMS["threshold"]),
+            "safety": _f(c.get("safety_factor"), DEFAULT_CAT_PARAMS["safety"]),
+        }
+        for c in categories
+    }
 
 
 # ══════════════════════════════════════════════
@@ -656,10 +678,8 @@ def page_stock_overview():
     all_names = tuple(p["name"] for p in products)
     key_index = build_bopomofo_index(all_names)
 
-    # 載入系統設定
-    settings = sb.table("system_settings").select("*").execute().data
-    safety_factor = float(next(s["value"] for s in settings if s["key"] == "safety_factor"))
-    stock_multiplier = float(next(s["value"] for s in settings if s["key"] == "stock_target_multiplier"))
+    # 載入各分類參數（備貨倍數 / 異常閾值 / 安全係數）
+    cat_params = build_category_params(categories)
 
     # 載入盤點紀錄
     all_logs = fetch_all(sb.table("inventory_logs").select(
@@ -766,15 +786,25 @@ def page_stock_overview():
                     if t["tx_date"] > meta
                 ), 1)
 
+        params = cat_params.get(p["categories"]["name"], DEFAULT_CAT_PARAMS)
         current_stock = float(cs["current_stock"]) if cs else 0
-        avg_c = calc_avg_consumption(consumed_recent_map.get(pid, []))
-        if avg_c > 0 and current_stock < avg_c * safety_factor:
-            suggested = max(0, round(avg_c * stock_multiplier - current_stock, 1))
+        recent_consumed = consumed_recent_map.get(pid, [])
+        avg_c = calc_avg_consumption(recent_consumed)
+        if avg_c > 0 and current_stock < avg_c * params["safety"]:
+            suggested = max(0, round(avg_c * params["multiplier"] - current_stock, 1))
         else:
             suggested = 0
 
+        # 異常狀態：最近一次耗用為負數，或 最近一次耗用 > 平均耗用 × 分類閾值
+        latest_consumed = recent_consumed[0] if recent_consumed else None
+        is_abnormal = latest_consumed is not None and (
+            latest_consumed < 0
+            or (avg_c > 0 and latest_consumed > avg_c * params["threshold"])
+        )
+
         row["即時庫存"] = current_stock
         row["平均耗用"] = round(avg_c, 1)
+        row["狀態"] = "🔴" if is_abnormal else ""
         row["建議叫貨"] = suggested
         row["叫貨"] = suggested
 
@@ -801,7 +831,7 @@ def page_stock_overview():
 
     # ── 主表格（data_editor）──
     inv_col_names = [c[0] for c in inv_col_specs]
-    visible_cols = ["品項", "廠牌1"] + inv_col_names + ["即時庫存", "平均耗用", "建議叫貨", "叫貨", "分類", "櫃位", "廠牌2"]
+    visible_cols = ["品項", "廠牌1", "即時庫存", "平均耗用", "狀態"] + inv_col_names + ["建議叫貨", "叫貨", "分類", "櫃位", "廠牌2"]
     df_display_ordered = df_display[visible_cols]
 
     col_config = {
@@ -812,7 +842,9 @@ def page_stock_overview():
         "分類": st.column_config.TextColumn(disabled=True, width="small"),
         "櫃位": st.column_config.TextColumn(disabled=True, width="small"),
         "廠牌2": st.column_config.TextColumn(disabled=True, width="small"),
-        "平均耗用": st.column_config.NumberColumn(disabled=True, format="%.1f", width="small"),
+        "平均耗用": st.column_config.NumberColumn(disabled=True, format="%.1f", pinned="left", width="small"),
+        "狀態": st.column_config.TextColumn("狀態", disabled=True, width="small",
+                                          help="🔴 = 最近一次耗用異常（為負數，或超過平均耗用×該分類閾值）"),
         "建議叫貨": st.column_config.NumberColumn(disabled=True, format="%.1f", width="small"),
         "叫貨": st.column_config.NumberColumn("叫貨 ✏️", min_value=0, format="%.1f", width="small"),
     }
@@ -824,7 +856,7 @@ def page_stock_overview():
         else:
             col_config[col_name] = st.column_config.NumberColumn(disabled=True, format="%.1f", width="small")
 
-    st.caption(f"💡 表格可左右拉動，「品項+廠牌+即時庫存」會固定在左側。")
+    st.caption(f"💡 表格可左右拉動，「品項＋廠牌＋即時庫存＋平均耗用」會固定在左側；狀態欄 🔴 = 最近一次耗用異常。")
     edited_stock_df = st.data_editor(
         df_display_ordered, use_container_width=True, hide_index=True,
         height=min(len(df_display_ordered) * 35 + 38, 700),
@@ -2744,9 +2776,7 @@ def page_analytics():
     tab_reorder, tab_ranking, tab_cabinet = st.tabs(["📦 建議叫貨", "🏆 常用排名", "🗄️ 櫃位分類"])
 
     with tab_reorder:
-        settings = sb.table("system_settings").select("*").execute().data
-        safety = float(next(s["value"] for s in settings if s["key"] == "safety_factor"))
-        multiplier = float(next(s["value"] for s in settings if s["key"] == "stock_target_multiplier"))
+        cat_params = build_category_params(load_categories())
 
         stock_data = []
         for cid in clinic_ids:
@@ -2764,13 +2794,14 @@ def page_analytics():
                 info = product_info.get(pid)
                 if not info:
                     continue
+                params = cat_params.get(info["category"], DEFAULT_CAT_PARAMS)
                 current = stock_map.get((pid, cid), 0)
-                if current < avg * safety:
+                if current < avg * params["safety"]:
                     reorder_rows.append({
                         "診所": "澤豐" if cid == 1 else "澤沛",
                         "品項": info["name"], "分類": info["category"],
                         "目前庫存": current, "平均耗用": round(avg, 1),
-                        "建議叫貨": max(0, round(avg * multiplier - current, 1)),
+                        "建議叫貨": max(0, round(avg * params["multiplier"] - current, 1)),
                     })
 
         if reorder_rows:
@@ -2945,9 +2976,7 @@ def page_order():
 
     sb = get_supabase_client()
 
-    settings = sb.table("system_settings").select("*").execute().data
-    safety = float(next(s["value"] for s in settings if s["key"] == "safety_factor"))
-    multiplier = float(next(s["value"] for s in settings if s["key"] == "stock_target_multiplier"))
+    cat_params = build_category_params(load_categories())
 
     brands = load_brands()
     brand_map = {b["id"]: b["name"] for b in brands}
@@ -2980,8 +3009,9 @@ def page_order():
 
         current = float(cs["current_stock"])
         avg = calc_avg_consumption(consumed_data.get(p["id"], []))
-        auto = avg > 0 and current < avg * safety
-        suggested = max(0, round(avg * multiplier - current, 1)) if auto else 0
+        params = cat_params.get(p["categories"]["name"], DEFAULT_CAT_PARAMS)
+        auto = avg > 0 and current < avg * params["safety"]
+        suggested = max(0, round(avg * params["multiplier"] - current, 1)) if auto else 0
 
         order_rows.append({
             "勾選": auto, "品項": p["name"], "分類": p["categories"]["name"],
@@ -3080,18 +3110,38 @@ def page_settings():
         ])
         tab_users = None
 
-    # ── 參數 ──
+    # ── 參數（各分類獨立）──
     with tab_params:
-        settings = sb.table("system_settings").select("*").execute().data
-        with st.form("settings_form"):
-            new_values = {}
-            for s in settings:
-                new_values[s["key"]] = st.number_input(s["description"], value=float(s["value"]),
-                                                        step=0.1, format="%.1f", key=f"s_{s['key']}")
-            if st.form_submit_button("儲存", type="primary"):
-                for k, v in new_values.items():
-                    sb.table("system_settings").update({"value": str(v)}).eq("key", k).execute()
-                st.success("已更新")
+        st.subheader("各分類參數設定")
+        st.caption("每個分類可獨立設定；計算「建議叫貨」與「異常耗用提醒」時，會套用該品項所屬分類的數值。")
+        param_cats = load_categories()
+        with st.form("cat_params_form"):
+            new_params = {}
+            for c in param_cats:
+                st.markdown(f"**{c['name']}**")
+                pc1, pc2, pc3 = st.columns(3)
+                with pc1:
+                    m = st.number_input("目標庫存備貨倍數",
+                                        value=float(c.get("stock_target_multiplier") or DEFAULT_CAT_PARAMS["multiplier"]),
+                                        min_value=0.0, step=0.1, format="%.1f", key=f"cp_m_{c['id']}")
+                with pc2:
+                    t = st.number_input("異常耗用警示閾值（倍數）",
+                                        value=float(c.get("anomaly_threshold") or DEFAULT_CAT_PARAMS["threshold"]),
+                                        min_value=0.0, step=0.1, format="%.1f", key=f"cp_t_{c['id']}")
+                with pc3:
+                    sfa = st.number_input("建議叫貨安全係數",
+                                          value=float(c.get("safety_factor") or DEFAULT_CAT_PARAMS["safety"]),
+                                          min_value=0.0, step=0.1, format="%.1f", key=f"cp_s_{c['id']}")
+                new_params[c["id"]] = {
+                    "stock_target_multiplier": m,
+                    "anomaly_threshold": t,
+                    "safety_factor": sfa,
+                }
+            if st.form_submit_button("儲存全部分類", type="primary"):
+                for cid, vals in new_params.items():
+                    sb.table("categories").update(vals).eq("id", cid).execute()
+                load_categories.clear()
+                st.success("已更新所有分類參數")
 
     # ── 分類 ──
     with tab_cats:
