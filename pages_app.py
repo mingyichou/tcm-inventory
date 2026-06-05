@@ -208,12 +208,12 @@ def get_clinic_id(clinic_name: str) -> int | None:
 def recalc_stock(product_id: int, clinic_id: int):
     """重算即時庫存 = 最後一次盤點數量 + 該盤點日期之後的進貨（依 tx_date）"""
     sb = get_supabase_client()
-    # 找最後一次盤點
+    # 找最後一次盤點（同日多筆時以 id 大者為準＝最後寫入的那筆，避免順序隨機）
     last_log = sb.table("inventory_logs").select(
         "current_count_qty, log_date"
     ).eq("product_id", product_id).eq(
         "clinic_id", clinic_id
-    ).order("log_date", desc=True).limit(1).execute().data
+    ).order("log_date", desc=True).order("id", desc=True).limit(1).execute().data
 
     if last_log:
         base_qty = float(last_log[0]["current_count_qty"])
@@ -249,7 +249,7 @@ def recalc_consumed_for_product(product_id: int, clinic_id: int):
         "id, log_date, current_count_qty"
     ).eq("product_id", product_id).eq(
         "clinic_id", clinic_id
-    ).order("log_date", desc=False).execute().data
+    ).order("log_date", desc=False).order("id", desc=False).execute().data
 
     if not logs:
         recalc_stock(product_id, clinic_id)
@@ -681,10 +681,10 @@ def page_stock_overview():
     # 載入各分類參數（備貨倍數 / 異常閾值 / 安全係數）
     cat_params = build_category_params(categories)
 
-    # 載入盤點紀錄
+    # 載入盤點紀錄（同日多筆時以 id 大者為新，確保 build_recent_consumed_map 取到最新一筆）
     all_logs = fetch_all(sb.table("inventory_logs").select(
-        "product_id, current_count_qty, consumed_qty, log_date, session_id"
-    ).eq("clinic_id", clinic_id).order("log_date", desc=True))
+        "id, product_id, current_count_qty, consumed_qty, log_date, session_id"
+    ).eq("clinic_id", clinic_id).order("log_date", desc=True).order("id", desc=True))
 
     # 計算每品項平均耗用（近 6 次，負數當 0，含 0 算分母）
     consumed_recent_map = build_recent_consumed_map(all_logs, n=6)
@@ -2017,7 +2017,9 @@ __VERIFY_RESULT__
                                         updated += 1
                                     else:
                                         # 新增（last/restock/consumed 由 recalc 重算）
-                                        sb.table("inventory_logs").insert({
+                                        # upsert：若該品項在此 session 其實已有 log（existing_log_map 漏抓/畫面快照過期），
+                                        # 改為更新而非重複新增，從根本杜絕重複 log
+                                        sb.table("inventory_logs").upsert({
                                             "session_id": int(session_id),
                                             "product_id": int(product_id),
                                             "clinic_id": int(clinic_id),
@@ -2026,7 +2028,7 @@ __VERIFY_RESULT__
                                             "current_count_qty": count_qty,
                                             "consumed_qty": 0,
                                             "log_date": final_date,
-                                        }).execute()
+                                        }, on_conflict="session_id,product_id").execute()
                                         inserted += 1
 
                                 # 重算所有受影響品項
@@ -2248,7 +2250,10 @@ __VERIFY_RESULT__
                                 })
 
                             # 先寫入 logs，再重算每個品項的所有耗用（含 last/restock/consumed）
-                            sb.table("inventory_logs").insert(logs_to_insert).execute()
+                            # upsert：同一 session 同品項只保留一筆（依 DB 唯一限制），避免重複送出造成重複 log
+                            sb.table("inventory_logs").upsert(
+                                logs_to_insert, on_conflict="session_id,product_id"
+                            ).execute()
 
                             for entry in logs_to_insert:
                                 recalc_consumed_for_product(int(entry["product_id"]), int(clinic_id))
@@ -2395,7 +2400,8 @@ __VERIFY_RESULT__
                                     updated += 1
                                 else:
                                     # 新增 log
-                                    sb.table("inventory_logs").insert({
+                                    # upsert：若畫面快照過期、該品項其實已有 log，改為更新而非重複新增
+                                    sb.table("inventory_logs").upsert({
                                         "session_id": int(s["id"]),
                                         "product_id": int(pid),
                                         "clinic_id": int(clinic_id),
@@ -2404,7 +2410,7 @@ __VERIFY_RESULT__
                                         "current_count_qty": new_qty,
                                         "consumed_qty": consumed,
                                         "log_date": s["session_date"],
-                                    }).execute()
+                                    }, on_conflict="session_id,product_id").execute()
                                     inserted += 1
 
                                 # 重算所有耗用量（含 last/restock/consumed）
@@ -2684,8 +2690,8 @@ def page_analytics():
     has_any = False
     for cid in clinic_ids:
         clinic_logs = fetch_all(sb.table("inventory_logs").select(
-            "product_id, consumed_qty, log_date, products(name, category_id, categories(name), units(name))"
-        ).eq("clinic_id", cid).order("log_date", desc=True))
+            "id, product_id, consumed_qty, log_date, products(name, category_id, categories(name), units(name))"
+        ).eq("clinic_id", cid).order("log_date", desc=True).order("id", desc=True))
         if clinic_logs:
             has_any = True
         consumed_per_clinic[cid] = build_recent_consumed_map(clinic_logs, n=6)
