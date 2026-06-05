@@ -1005,9 +1005,9 @@ def page_transactions():
         st.caption("💡 填完後請**點下方「確認登錄」按鈕**，按 Enter 不會送出")
         col1, col2, col3 = st.columns(3)
         with col1:
-            tx_type = st.selectbox("異動類型", ["進貨", "調撥", "廢棄"], key="tx_type_input")
+            tx_type = st.selectbox("異動類型", ["進貨", "調撥", "退貨/廢棄"], key="tx_type_input")
         with col2:
-            qty = st.number_input("數量（負數=調出/廢棄）", value=0.0, step=0.1, format="%.1f", key="tx_qty_input")
+            qty = st.number_input("數量（負數=調出或退貨/廢棄）", value=0.0, step=0.1, format="%.1f", key="tx_qty_input")
         with col3:
             tx_date = st.date_input("日期", value=date.today(), key="tx_date_input")
 
@@ -1062,7 +1062,7 @@ def page_transactions():
         with col1:
             days_filter = st.selectbox("時間範圍", ["最近 30 天", "最近 7 天", "最近 90 天", "全部"], key="tx_days")
         with col2:
-            type_filter = st.selectbox("類型", ["全部", "進貨", "調撥", "廢棄"], key="tx_type_filter")
+            type_filter = st.selectbox("類型", ["全部", "進貨", "調撥", "退貨/廢棄"], key="tx_type_filter")
         with col3:
             name_search = st.text_input("🔍 搜尋品項", placeholder="輸入品項名稱（可注音首碼，如 ee=葛根）", key="tx_hist_search")
 
@@ -1176,9 +1176,11 @@ def page_transactions():
             with col_a:
                 edit_qty = st.number_input("數量", value=float(tx_item["change_qty"]), step=0.1, format="%.1f", key="tx_edit_qty")
             with col_b:
-                type_list = ["進貨", "調撥", "廢棄"]
+                type_list = ["進貨", "調撥", "退貨/廢棄"]
+                # 防呆：若舊資料尚有未遷移的值（如「廢棄」），不讓 .index 例外造成當機
+                cur_idx = type_list.index(tx_item["tx_type"]) if tx_item["tx_type"] in type_list else 0
                 edit_type = st.selectbox("類型", type_list,
-                                         index=type_list.index(tx_item["tx_type"]), key="tx_edit_type")
+                                         index=cur_idx, key="tx_edit_type")
             with col_c:
                 edit_note = st.text_input("備註", value=tx_item["note"] or "", key="tx_edit_note")
 

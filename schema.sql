@@ -72,7 +72,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     clinic_id INTEGER NOT NULL REFERENCES clinics(id),
     change_qty NUMERIC(10,2) NOT NULL,
     tx_date DATE NOT NULL DEFAULT CURRENT_DATE,
-    tx_type VARCHAR(20) NOT NULL CHECK (tx_type IN ('進貨', '調撥', '廢棄')),
+    tx_type VARCHAR(20) NOT NULL CHECK (tx_type IN ('進貨', '調撥', '退貨/廢棄')),
     note VARCHAR(500),
     created_by INTEGER REFERENCES users(id),
     created_at TIMESTAMP DEFAULT NOW()
