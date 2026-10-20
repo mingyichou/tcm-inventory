@@ -9,7 +9,8 @@ import pandas as pd
 from datetime import date, datetime, timedelta
 from collections import defaultdict
 from pypinyin import pinyin, Style
-from database import get_supabase_client, fetch_all
+from database import get_supabase_client, fetch_all, with_retry, NETWORK_ERRORS
+import html as _html
 
 
 # ══════════════════════════════════════════════
@@ -174,34 +175,40 @@ def style_banded(df, highlight_col=None, bold_cols=None, big_bold_col=None):
 
 @st.cache_data(ttl=30)
 def load_products():
-    sb = get_supabase_client()
-    data = sb.table("products").select(
+    data = with_retry(lambda: get_supabase_client().table("products").select(
         "id, name, category_id, unit_id, spec_note, "
         "categories(name), units(name)"
-    ).execute().data
+    ).execute().data)
     return sort_products_by_bopomofo(data)
 
 @st.cache_data(ttl=30)
 def load_brands():
-    sb = get_supabase_client()
-    return sb.table("brands").select("id, name").order("id").execute().data
+    return with_retry(lambda: get_supabase_client().table("brands").select("id, name").order("id").execute().data)
 
 @st.cache_data(ttl=30)
 def load_categories():
-    sb = get_supabase_client()
-    return sb.table("categories").select(
-        "id, name, default_unit_id, default_spec_note, "
-        "stock_target_multiplier, anomaly_threshold, safety_factor"
-    ).order("id").execute().data
+    base_cols = ("id, name, default_unit_id, default_spec_note, "
+                 "stock_target_multiplier, anomaly_threshold, safety_factor")
+
+    def _query(cols):
+        return with_retry(lambda: get_supabase_client().table("categories").select(cols).order("id").execute().data)
+
+    try:
+        return _query(base_cols + ", avg_window")
+    except Exception:
+        # migration_v7_avg_window.sql 尚未執行（沒有 avg_window 欄位）→ 以 None 代表「未設定」，計算時套預設 6
+        data = _query(base_cols)
+        for c in data:
+            c["avg_window"] = None
+        return data
 
 @st.cache_data(ttl=30)
 def load_units():
-    sb = get_supabase_client()
-    return sb.table("units").select("id, name").order("id").execute().data
+    return with_retry(lambda: get_supabase_client().table("units").select("id, name").order("id").execute().data)
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_clinic_id(clinic_name: str) -> int | None:
-    sb = get_supabase_client()
-    resp = sb.table("clinics").select("id").eq("name", clinic_name).execute()
+    resp = with_retry(lambda: get_supabase_client().table("clinics").select("id").eq("name", clinic_name).execute())
     return resp.data[0]["id"] if resp.data else None
 
 
@@ -234,6 +241,7 @@ def recalc_stock(product_id: int, clinic_id: int):
     sb.table("clinic_stock").update(
         {"current_stock": new_stock}
     ).eq("product_id", product_id).eq("clinic_id", clinic_id).execute()
+    invalidate_stock_cache()
     return new_stock
 
 
@@ -312,17 +320,26 @@ def calc_avg_consumption(consumed_list_recent_first: list, max_n: int = 6) -> fl
     return total / len(recent)
 
 
-def build_recent_consumed_map(logs_desc: list, n: int = 6) -> dict:
+def build_recent_consumed_map(logs_desc: list, n: int = 6, window_start: str | None = None) -> dict:
     """logs_desc 已按 log_date desc 排序。回傳 {pid: [近 n 筆 consumed_qty 由新到舊]}。
-    重要：排除每品項最早的那一筆 — 首次盤點的 consumed=0 是人為 placeholder（沒基準），不應計入平均。"""
+    重要：排除每品項最早的那一筆 — 首次盤點的 consumed=0 是人為 placeholder（沒基準），不應計入平均。
+
+    window_start：logs_desc 若只抓了「近 K 次盤點日期」（見 load_recent_logs），傳入該視窗最早的日期。
+      品項若在 window_start 當天有盤點，代表它更早就存在（診所每次盤點都盤全部品項），
+      其視窗內最早一筆是真實數據，不排除；反之（最早一筆晚於 window_start）就是首盤 placeholder，排除。"""
     by_pid_full = defaultdict(list)
     for log in logs_desc:
         by_pid_full[log["product_id"]].append(log)
 
     result = {}
     for pid, plogs in by_pid_full.items():
-        # plogs 已是 desc，最後一筆是最早的（首次盤點）→ 排除
-        non_first = plogs[:-1] if len(plogs) > 1 else []
+        # plogs 已是 desc，最後一筆是最早的
+        earliest = plogs[-1]
+        has_older_history = window_start is not None and earliest["log_date"] <= window_start
+        if has_older_history:
+            non_first = plogs
+        else:
+            non_first = plogs[:-1] if len(plogs) > 1 else []
         recent = non_first[:n]
         result[pid] = [
             float(log.get("consumed_qty") or 0)
@@ -331,13 +348,18 @@ def build_recent_consumed_map(logs_desc: list, n: int = 6) -> dict:
     return result
 
 
-# 分類參數預設值（migration_v4 之前的全域值）
-DEFAULT_CAT_PARAMS = {"multiplier": 2.0, "threshold": 1.5, "safety": 1.2}
+# 分類參數預設值（migration_v4 之前的全域值；avg_n 為 migration_v7 新增）
+DEFAULT_AVG_WINDOW = 6
+DEFAULT_CAT_PARAMS = {"multiplier": 2.0, "threshold": 1.5, "safety": 1.2, "avg_n": DEFAULT_AVG_WINDOW}
+
+# 庫存頁顯示的盤點次數（盤/進/耗 欄）
+MAX_DISPLAY_DATES = 6
 
 
 def build_category_params(categories: list) -> dict:
-    """{分類名稱: {"multiplier","threshold","safety"}}；缺值套用全域預設。
-    multiplier=目標庫存備貨倍數、threshold=異常耗用警示閾值、safety=建議叫貨安全係數。"""
+    """{分類名稱: {"multiplier","threshold","safety","avg_n"}}；缺值套用全域預設。
+    multiplier=目標庫存備貨倍數、threshold=異常耗用警示閾值、safety=建議叫貨安全係數、
+    avg_n=平均耗用計算次數（近 N 次盤點）。"""
     def _f(v, d):
         return float(v) if v not in (None, "") else d
     return {
@@ -345,9 +367,76 @@ def build_category_params(categories: list) -> dict:
             "multiplier": _f(c.get("stock_target_multiplier"), DEFAULT_CAT_PARAMS["multiplier"]),
             "threshold": _f(c.get("anomaly_threshold"), DEFAULT_CAT_PARAMS["threshold"]),
             "safety": _f(c.get("safety_factor"), DEFAULT_CAT_PARAMS["safety"]),
+            "avg_n": max(1, int(_f(c.get("avg_window"), DEFAULT_AVG_WINDOW))),
         }
         for c in categories
     }
+
+
+def max_avg_window(cat_params: dict) -> int:
+    """各分類「平均耗用計算次數」的最大值。"""
+    return max([p["avg_n"] for p in cat_params.values()] + [DEFAULT_AVG_WINDOW])
+
+
+def avg_window_dates(cat_params: dict) -> int:
+    """需要抓取的盤點日期數：max(顯示次數, 最大平均耗用計算次數 + 1)。
+    +1 是因為每品項最早一筆（首盤 placeholder）會被排除，要多留一筆才湊得滿 N 次。"""
+    return max(MAX_DISPLAY_DATES, max_avg_window(cat_params) + 1)
+
+
+# ── 庫存頁資料快取 ──
+# Why: 每次 rerun（改字級、搜尋、換分類）都重打約 10 次 Supabase 查詢，而且偶爾單一請求會卡住數秒，
+#      是庫存頁「每個動作都要等」的主因。資料改以 cache_data 保存 10 分鐘，
+#      任何寫入（盤點/進退貨/改錯/品項設定）後呼叫 invalidate_stock_cache() 立即失效。
+
+@st.cache_data(ttl=600, show_spinner="讀取庫存資料中…")
+def load_stock_snapshot(clinic_id: int) -> tuple[list, list]:
+    """(clinic_stock 列, products 列)。"""
+    def _do():
+        sb = get_supabase_client()
+        cs_data = sb.table("clinic_stock").select(
+            "product_id, current_stock, brand1_id, brand2_id, is_active, cabinet"
+        ).eq("clinic_id", clinic_id).execute().data
+        products = sb.table("products").select(
+            "id, name, category_id, categories(name), units(name)"
+        ).execute().data
+        return cs_data, products
+    return with_retry(_do)
+
+
+@st.cache_data(ttl=600, show_spinner="讀取盤點紀錄中…")
+def load_recent_logs(clinic_id: int, k_dates: int, columns: str) -> tuple[list, str | None]:
+    """只抓最近 k_dates 個盤點日期的 inventory_logs（log_date desc, id desc）。
+    回傳 (logs, window_start)；window_start=None 表示盤點日期數不足 k_dates，已含全部歷史。
+    同日多筆時以 id 大者為新，確保 build_recent_consumed_map 取到最新一筆。"""
+    def _do():
+        sb = get_supabase_client()
+        sess = sb.table("inventory_sessions").select("session_date").eq("clinic_id", clinic_id).execute().data
+        dates_desc = sorted({s["session_date"] for s in sess}, reverse=True)
+        window_start = dates_desc[k_dates - 1] if len(dates_desc) >= k_dates else None
+        q = sb.table("inventory_logs").select(columns).eq("clinic_id", clinic_id)
+        if window_start:
+            q = q.gte("log_date", window_start)
+        logs = fetch_all(q.order("log_date", desc=True).order("id", desc=True))
+        return logs, window_start
+    return with_retry(_do)
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_transactions_since(clinic_id: int, since: str | None) -> list:
+    """進退貨紀錄（tx_date asc）；since 給定時只抓該日（含）之後。"""
+    def _do():
+        q = get_supabase_client().table("transactions").select("product_id, change_qty, tx_date").eq("clinic_id", clinic_id)
+        if since:
+            q = q.gte("tx_date", since)
+        return fetch_all(q.order("tx_date"))
+    return with_retry(_do)
+
+
+def invalidate_stock_cache():
+    """清除庫存頁資料快取。任何改變庫存/盤點/進退貨/品項設定的寫入後呼叫。"""
+    for fn in (load_stock_snapshot, load_recent_logs, load_transactions_since):
+        fn.clear()
 
 
 # ══════════════════════════════════════════════
@@ -555,80 +644,233 @@ def _build_stock_excel(df, clinic_name, recent_dates, product_log_map, tx_by_pro
 
 
 # ══════════════════════════════════════════════
-#  叫貨單 Excel 產生器
+#  庫存表 HTML 渲染器
 # ══════════════════════════════════════════════
+# Why: Streamlit 內建表格（data_editor / dataframe）做不到行底色交替、每 5 行粗線、
+#      異常格紅字、常駐捲軸、預設捲到最右。改以自訂 HTML + 少量 JS 嵌在 components.html
+#      的 iframe 內，外觀與捲動行為可完全掌控。表格為純顯示，叫貨請至「叫貨出表」頁。
 
-def _build_order_excel(order_data):
-    """產生叫貨單 Excel：單一 sheet，依廠牌分區，4 欄品項+數量，全格線"""
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
+STOCK_TABLE_ZOOM_OPTIONS = [100, 110, 120, 130, 140, 150]
+STOCK_TABLE_ZOOM_DEFAULT = 130
+STOCK_TEXT_COLS = {"品項", "廠牌", "廠牌1", "廠牌2", "分類", "櫃位"}
 
-    thin = Side(style="thin")
-    border_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "叫貨單"
-    ws.page_setup.orientation = "portrait"
-    ws.page_setup.paperSize = ws.PAPERSIZE_A4
-    ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 0
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
+def is_abnormal_consumed(consumed, avg_c: float, threshold: float) -> bool:
+    """單格耗用是否異常：為負數；或 平均耗用>0 且 耗用>平均×分類閾值 且 耗用>1（避免小量誤判）。"""
+    if consumed is None:
+        return False
+    try:
+        v = float(consumed)
+    except (TypeError, ValueError):
+        return False
+    if pd.isna(v):
+        return False
+    return v < 0 or (avg_c > 0 and v > avg_c * threshold and v > 1)
 
-    for i in range(4):
-        ws.column_dimensions[get_column_letter(i * 2 + 1)].width = 14
-        ws.column_dimensions[get_column_letter(i * 2 + 2)].width = 5
 
-    brand_font = Font(bold=True, size=11)
-    header_font = Font(bold=True, size=9)
-    data_font = Font(size=9)
-    center = Alignment(horizontal="center", vertical="center")
+def _stock_header_html(col_name: str) -> str:
+    """'盤(03/24)' -> 盤 + 小字日期；'進(03/24~04/07)' 同理；其餘原樣。"""
+    for prefix in ("盤", "進", "耗"):
+        if col_name.startswith(prefix + "(") and col_name.endswith(")"):
+            return f"{prefix}<small>{_html.escape(col_name[2:-1])}</small>"
+    return _html.escape(str(col_name))
 
-    row_num = 1
 
-    for brand_name, group in order_data.groupby("廠牌"):
-        if not brand_name or brand_name == "-":
-            brand_name = "未指定"
+def _fmt_cell(v) -> str:
+    """數值一律 1 位小數；None/NaN 顯示空白；文字跳脫。"""
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return _html.escape(v)
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return _html.escape(str(v))
+    if pd.isna(f):
+        return ""
+    return f"{f:.1f}"
 
-        cell = ws.cell(row=row_num, column=1, value=brand_name)
-        cell.font = brand_font
-        row_num += 1
 
-        for i in range(4):
-            c1 = ws.cell(row=row_num, column=i * 2 + 1, value="品項")
-            c1.font = header_font
-            c1.border = border_thin
-            c2 = ws.cell(row=row_num, column=i * 2 + 2, value="數量")
-            c2.font = header_font
-            c2.border = border_thin
-            c2.alignment = center
-        row_num += 1
+_STOCK_TABLE_CSS = """
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: transparent; }
+#wrap {
+  font-family: "Segoe UI", "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", system-ui, sans-serif;
+  font-size: __FONT__px; color: #111; line-height: 1.25;
+  --l0: 0px; --l1: 0px; --l2: 0px; --l3: 0px; --l4: 0px;
+}
+.hbar { overflow-x: scroll; overflow-y: hidden; height: 18px; margin: 0 0 4px 0; }
+.hbar > div { height: 1px; }
+#box { overflow: auto; height: __BOXH__px; border: 1px solid #C9BEE8; border-radius: 6px; background: #F7F4FC; }
+table { border-collapse: separate; border-spacing: 0; white-space: nowrap; font-variant-numeric: tabular-nums; }
+th, td { padding: 0.28em 0.5em; border-bottom: 1px solid #D5CBEC; border-right: 1px solid #E3DCF3; }
+th { position: sticky; top: 0; z-index: 2; background: #D9CFF0; color: #111; font-weight: 700;
+     text-align: center; vertical-align: bottom; border-bottom: 2px solid #6A5ACD; }
+th small { display: block; font-size: 0.72em; font-weight: 600; color: #3B2E7E; }
+td.n { text-align: right; }
+tr.o td { background: #F7F4FC; }
+tr.e td { background: #ECE6F7; }
+tr.b5 td { border-bottom: 3px solid #6A5ACD; }
+td.p, th.p { position: sticky; z-index: 1; }
+th.p { z-index: 3; }
+.p0 { left: var(--l0); } .p1 { left: var(--l1); } .p2 { left: var(--l2); }
+.p3 { left: var(--l3); } .p4 { left: var(--l4); }
+td.plast, th.plast { border-right: 3px solid #6A5ACD; }
+td.name { font-weight: 600; }
+td.stock { font-weight: 700; font-size: 1.06em; }
+td.sug:not(:empty) { font-weight: 700; color: #4B3BA8; }
+td.abn { color: #D32F2F; font-weight: 800; }
+/* 常駐、加粗的捲軸（不需滑鼠移過才出現） */
+.hbar::-webkit-scrollbar, #box::-webkit-scrollbar { height: 16px; width: 16px; }
+.hbar::-webkit-scrollbar-track, #box::-webkit-scrollbar-track { background: #E6E0F2; border-radius: 8px; }
+.hbar::-webkit-scrollbar-thumb, #box::-webkit-scrollbar-thumb {
+  background: #8E7CC3; border-radius: 8px; border: 3px solid #E6E0F2; }
+.hbar::-webkit-scrollbar-thumb:hover, #box::-webkit-scrollbar-thumb:hover { background: #6A5ACD; }
+#box::-webkit-scrollbar-corner { background: #E6E0F2; }
+"""
 
-        items = list(group.itertuples(index=False))
-        for chunk_start in range(0, len(items), 4):
-            chunk = items[chunk_start:chunk_start + 4]
-            for i, item in enumerate(chunk):
-                c1 = ws.cell(row=row_num, column=i * 2 + 1, value=item.品項)
-                c1.font = data_font
-                c1.border = border_thin
-                _qty = float(item.叫貨數量)
-                c2 = ws.cell(row=row_num, column=i * 2 + 2, value=("" if _qty == 0 else round(_qty, 1)))
-                c2.font = data_font
-                c2.alignment = center
-                c2.border = border_thin
-            # 填滿空格的格線
-            for i in range(len(chunk), 4):
-                ws.cell(row=row_num, column=i * 2 + 1).border = border_thin
-                ws.cell(row=row_num, column=i * 2 + 2).border = border_thin
-            row_num += 1
+_STOCK_TABLE_JS = """
+(function () {
+  var wrap = document.getElementById('wrap');
+  var box = document.getElementById('box');
+  var top = document.getElementById('top');
+  var topin = document.getElementById('topin');
+  var tbl = document.getElementById('tbl');
+  var PIN = __PIN__;
+  var CAP = __CAP__;
 
-        row_num += 1
+  // 同源 iframe 可直接調整自身高度；若取不到就退回 Python 給的固定高度
+  var frameOK = false;
+  try { frameOK = !!window.frameElement; } catch (e) { frameOK = false; }
 
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.getvalue()
+  // 固定欄的 left 偏移：依實際表頭寬度計算，字級/字型變動都不會跑掉
+  function pinOffsets() {
+    var ths = tbl.tHead.rows[0].cells, left = 0;
+    for (var i = 0; i < PIN && i < ths.length; i++) {
+      wrap.style.setProperty('--l' + i, left + 'px');
+      left += ths[i].getBoundingClientRect().width;
+    }
+  }
+  // 表格高度配合瀏覽器視窗：頁面往下捲到表格頂端時，含底部捲軸整個都在畫面內
+  function fit() {
+    var full = Math.ceil(tbl.getBoundingClientRect().height) + 20;
+    var cap = CAP;
+    try {
+      var vh = window.parent.innerHeight;
+      if (vh) cap = Math.max(320, vh - 140);
+    } catch (e) {}
+    if (!frameOK) cap = Math.min(cap, window.innerHeight - top.offsetHeight - 8);
+    var h = Math.max(120, Math.min(full, cap));
+    box.style.height = h + 'px';
+    // 上方捲軸的寬度對齊表格可視區（扣掉垂直捲軸），兩者的最大捲動量才一致
+    top.style.width = box.clientWidth + 'px';
+    topin.style.width = box.scrollWidth + 'px';
+    if (frameOK) {
+      try {
+        var fe = window.frameElement;
+        var total = (h + top.offsetHeight + 10) + 'px';
+        fe.style.height = total;
+        // Streamlit 的元件容器有自己的固定高度，一併撐開，否則 iframe 會壓到下方元件
+        var holder = fe.closest ? fe.closest('[data-testid="stElementContainer"]') : null;
+        (holder || fe.parentElement).style.height = total;
+      } catch (e) {}
+    }
+  }
+  // 上方捲軸與表格捲動同步；並記住使用者是否停在最右端（視窗縮放/改變大小後維持在最右）
+  var atRight = true;
+  function noteEdge() { atRight = (box.scrollLeft >= box.scrollWidth - box.clientWidth - 2); }
+  top.addEventListener('scroll', function () { box.scrollLeft = top.scrollLeft; noteEdge(); });
+  box.addEventListener('scroll', function () { top.scrollLeft = box.scrollLeft; noteEdge(); });
+
+  function layout(scrollRight) {
+    pinOffsets(); fit();
+    if (scrollRight) { box.scrollLeft = box.scrollWidth; }
+    top.scrollLeft = box.scrollLeft;
+    noteEdge();
+  }
+  layout(true);
+  window.addEventListener('resize', function () { layout(atRight); });
+  if (document.fonts && document.fonts.ready) { document.fonts.ready.then(function () { layout(true); }); }
+  setTimeout(function () { layout(true); }, 150);
+})();
+"""
+
+
+def render_stock_table(df: pd.DataFrame, columns: list, pinned: int, abn_flags: list | None,
+                       zoom_pct: int, max_height: int = 650):
+    """以 HTML 表格渲染庫存表（純顯示）。
+    columns: 顯示欄位（依序）；pinned: 左側固定欄數（最多 5）；
+    abn_flags: 與 df 列對齊的 set 清單（該列異常耗用的欄名），None 表示不標示；
+    zoom_pct: 表格字級 100~150。
+    視覺：單雙行淡紫交替、每 5 行粗紫線、文字近黑、異常耗用格紅色粗體。
+    捲動：上下兩條常駐橫向捲軸同步、載入後自動捲到最右、高度自動配合瀏覽器視窗。"""
+    font_px = 14 * zoom_pct / 100
+    n_rows = len(df)
+    pinned = max(0, min(pinned, len(columns), 5))
+
+    def _cls(i, c):
+        cls = []
+        if c not in STOCK_TEXT_COLS:
+            cls.append("n")
+        if i < pinned:
+            cls.append(f"p p{i}")
+            if i == pinned - 1:
+                cls.append("plast")
+        return cls
+
+    head_cells = []
+    for i, c in enumerate(columns):
+        head_cells.append(f'<th class="{" ".join(_cls(i, c))}">{_stock_header_html(c)}</th>')
+    thead = "<tr>" + "".join(head_cells) + "</tr>"
+
+    body = []
+    for r_idx, vals in enumerate(df[columns].itertuples(index=False, name=None)):
+        flags = abn_flags[r_idx] if abn_flags else ()
+        row_cls = "o" if r_idx % 2 == 0 else "e"
+        if (r_idx + 1) % 5 == 0:
+            row_cls += " b5"
+        cells = []
+        for i, (c, v) in enumerate(zip(columns, vals)):
+            cls = _cls(i, c)
+            if c == "品項":
+                cls.append("name")
+            elif c == "即時庫存":
+                cls.append("stock")
+            elif c == "建議叫貨":
+                cls.append("sug")
+            if c in flags:
+                cls.append("abn")
+            cells.append(f'<td class="{" ".join(cls)}">{_fmt_cell(v)}</td>')
+        body.append(f'<tr class="{row_cls}">' + "".join(cells) + "</tr>")
+
+    # 初始高度估算（JS 取得視窗高度後會再調整）
+    row_h = font_px * 1.81 + 1
+    est_total = int(n_rows * row_h + font_px * 3.2 + 20 + 22 + 10)
+    py_height = min(est_total, max_height + 40)
+    box_h = min(int(n_rows * row_h + font_px * 3.2 + 20), max_height)
+
+    css = (_STOCK_TABLE_CSS
+           .replace("__FONT__", f"{font_px:.1f}")
+           .replace("__BOXH__", str(box_h)))
+    js = (_STOCK_TABLE_JS
+          .replace("__PIN__", str(pinned))
+          .replace("__CAP__", str(max_height)))
+
+    html_doc = (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        f"<style>{css}</style></head><body>"
+        '<div id="wrap">'
+        '<div id="top" class="hbar"><div id="topin"></div></div>'
+        '<div id="box"><table id="tbl">'
+        f"<thead>{thead}</thead><tbody>{''.join(body)}</tbody>"
+        "</table></div></div>"
+        f"<script>{js}</script></body></html>"
+    )
+    if hasattr(st, "iframe"):
+        st.iframe(html_doc, height=py_height)
+    else:  # 舊版 Streamlit 沒有 st.iframe
+        import streamlit.components.v1 as components
+        components.html(html_doc, height=py_height, scrolling=False)
 
 
 # ══════════════════════════════════════════════
@@ -653,44 +895,62 @@ def page_stock_overview():
     brand_map = {b["id"]: b["name"] for b in brands_data}
     categories = load_categories()
 
-    col1, col2, col3 = st.columns([2, 3, 1])
+    col1, col2, col3, col4 = st.columns([2, 3, 1.1, 1])
     with col1:
         cat_filter = st.selectbox("分類", ["全部"] + [c["name"] for c in categories], key="stock_cat")
     with col2:
         search = st.text_input("搜尋", placeholder="中文 或 注音首碼（ee=葛根, 2e=當歸）", key="stock_search")
     with col3:
+        zoom_pct = st.selectbox(
+            "表格字級", STOCK_TABLE_ZOOM_OPTIONS,
+            index=STOCK_TABLE_ZOOM_OPTIONS.index(STOCK_TABLE_ZOOM_DEFAULT),
+            format_func=lambda v: f"{v}%", key="stock_zoom",
+            help="只放大表格本身，與瀏覽器縮放（Ctrl+滾輪）互不影響",
+        )
+    with col4:
         simple_view = st.toggle("📱 簡化檢視", value=False, key="stock_simple",
                                  help="行動版精簡欄位（品項/廠牌/即時庫存/平均耗用）")
 
-    # 載入 per-clinic 資料（先載入以便排序時用櫃位）
-    cs_data = sb.table("clinic_stock").select(
-        "product_id, current_stock, brand1_id, brand2_id, is_active, cabinet"
-    ).eq("clinic_id", clinic_id).execute().data
+    # 載入 per-clinic 資料與品項（快取；先載入以便排序時用櫃位）
+    try:
+        cs_data, products = load_stock_snapshot(int(clinic_id))
+    except NETWORK_ERRORS:
+        st.error("連線資料庫逾時（已自動重試 3 次）。請稍候按下方「重新讀取資料」，或檢查網路。")
+        if st.button("🔄 重新讀取資料", key="stock_retry_snapshot"):
+            invalidate_stock_cache()
+            st.rerun()
+        return
     cs_map = {s["product_id"]: s for s in cs_data}
 
-    # 載入品項並依（分類→首字注音→櫃位→全字注音）排序
-    products = sb.table("products").select(
-        "id, name, category_id, categories(name), units(name)"
-    ).execute().data
+    # 依（分類→首字注音→櫃位→全字注音）排序
     products = sort_products_by_bopomofo(products, cs_map=cs_map)
 
     # 搜尋索引
     all_names = tuple(p["name"] for p in products)
     key_index = build_bopomofo_index(all_names)
 
-    # 載入各分類參數（備貨倍數 / 異常閾值 / 安全係數）
+    # 載入各分類參數（備貨倍數 / 異常閾值 / 安全係數 / 平均耗用計算次數）
     cat_params = build_category_params(categories)
 
-    # 載入盤點紀錄（同日多筆時以 id 大者為新，確保 build_recent_consumed_map 取到最新一筆）
-    all_logs = fetch_all(sb.table("inventory_logs").select(
-        "id, product_id, current_count_qty, consumed_qty, log_date, session_id"
-    ).eq("clinic_id", clinic_id).order("log_date", desc=True).order("id", desc=True))
+    # 載入盤點紀錄：只抓近 K 次盤點日期（K = max(顯示 6 次, 最大平均耗用計算次數 + 1)），快取
+    try:
+        all_logs, window_start = load_recent_logs(
+            int(clinic_id), avg_window_dates(cat_params),
+            "id, product_id, current_count_qty, consumed_qty, log_date, session_id",
+        )
+        all_tx = load_transactions_since(int(clinic_id), window_start)
+    except NETWORK_ERRORS:
+        st.error("讀取盤點紀錄逾時（已自動重試 3 次）。請稍候按下方「重新讀取資料」，或檢查網路。")
+        if st.button("🔄 重新讀取資料", key="stock_retry_logs"):
+            invalidate_stock_cache()
+            st.rerun()
+        return
 
-    # 計算每品項平均耗用（近 6 次，負數當 0，含 0 算分母）
-    consumed_recent_map = build_recent_consumed_map(all_logs, n=6)
+    # 每品項近 N 次耗用（負數當 0，含 0 算分母；N 依分類，先取最大 N，計算時再依分類截取）
+    consumed_recent_map = build_recent_consumed_map(all_logs, n=max_avg_window(cat_params),
+                                                    window_start=window_start)
 
-    # 取最近 12 次不重複盤點日期（asc：舊→新）— 限制顯示量避免欄位過多
-    MAX_DISPLAY_DATES = 12
+    # 取最近 MAX_DISPLAY_DATES 次不重複盤點日期（asc：舊→新）
     seen_d = set()
     recent_desc = []
     for log in all_logs:  # already desc by log_date
@@ -724,10 +984,7 @@ def page_stock_overview():
         if d not in product_log_map[pid]:
             product_log_map[pid][d] = log
 
-    # 進退貨
-    all_tx = fetch_all(sb.table("transactions").select(
-        "product_id, change_qty, tx_date"
-    ).eq("clinic_id", clinic_id).order("tx_date"))
+    # 進退貨（只需視窗內的；已於上方與盤點紀錄一併載入）
     tx_by_product = defaultdict(list)
     for tx in all_tx:
         tx_by_product[tx["product_id"]].append(tx)
@@ -735,6 +992,7 @@ def page_stock_overview():
     # 組裝表格
     rows = []
     product_id_list = []
+    abn_flags = []  # 與 rows 對齊：每列異常耗用的欄名集合
 
     for p in products:
         pid = p["id"]
@@ -747,14 +1005,20 @@ def page_stock_overview():
             continue
 
         p_logs = product_log_map.get(pid, {})
+        cat_name = p["categories"]["name"]
+        params = cat_params.get(cat_name, DEFAULT_CAT_PARAMS)
+        current_stock = float(cs["current_stock"]) if cs else 0
+        recent_consumed = consumed_recent_map.get(pid, [])
+        avg_c = calc_avg_consumption(recent_consumed, max_n=params["avg_n"])
+        abn_cols = set()  # 此列中耗用異常的欄名（含歷史；修正盤點數/進退貨後重算即消失）
 
         row = {
             "_pid": pid,
             "品項": p["name"],
             "廠牌1": brand_map.get(cs.get("brand1_id"), "-"),
-            "分類": p["categories"]["name"],
-            "櫃位": cs.get("cabinet") or "",
             "廠牌2": brand_map.get(cs.get("brand2_id"), "-"),
+            "分類": cat_name,
+            "櫃位": cs.get("cabinet") or "",
         }
 
         # 動態盤點/進貨/耗用欄
@@ -777,7 +1041,11 @@ def page_stock_overview():
                         float(t["change_qty"]) for t in tx_by_product.get(pid, [])
                         if d_a < t["tx_date"] <= d_b
                     )
-                    row[col_name] = round(float(lg_a["current_count_qty"]) + restock - float(lg_b["current_count_qty"]), 1)
+                    consumed = round(float(lg_a["current_count_qty"]) + restock - float(lg_b["current_count_qty"]), 1)
+                    row[col_name] = consumed
+                    # 每一格耗用都套用異常規則（不只最近一次），以紅色粗體標示
+                    if is_abnormal_consumed(consumed, avg_c, params["threshold"]):
+                        abn_cols.add(col_name)
                 else:
                     row[col_name] = None
             elif ctype == "restock_now":
@@ -786,31 +1054,18 @@ def page_stock_overview():
                     if t["tx_date"] > meta
                 ), 1)
 
-        params = cat_params.get(p["categories"]["name"], DEFAULT_CAT_PARAMS)
-        current_stock = float(cs["current_stock"]) if cs else 0
-        recent_consumed = consumed_recent_map.get(pid, [])
-        avg_c = calc_avg_consumption(recent_consumed)
         if avg_c > 0 and current_stock < avg_c * params["safety"]:
             suggested = max(0, round(avg_c * params["multiplier"] - current_stock, 1))
         else:
             suggested = 0
 
-        # 異常狀態：(1) 最近一次耗用為負數；或
-        #          (2) 最近一次耗用 > 平均耗用×分類閾值 且 耗用 > 1
-        latest_consumed = recent_consumed[0] if recent_consumed else None
-        is_abnormal = latest_consumed is not None and (
-            latest_consumed < 0
-            or (avg_c > 0 and latest_consumed > avg_c * params["threshold"] and latest_consumed > 1)
-        )
-
         row["即時庫存"] = current_stock
         row["平均耗用"] = round(avg_c, 1)
-        row["狀態"] = "🔴" if is_abnormal else ""
         row["建議叫貨"] = suggested
-        row["叫貨"] = suggested
 
         rows.append(row)
         product_id_list.append(pid)
+        abn_flags.append(abn_cols)
 
     if not rows:
         st.info("沒有符合條件的品項")
@@ -822,68 +1077,21 @@ def page_stock_overview():
     # ── 簡化檢視（手機）──
     if simple_view:
         simple_df = df_display[["品項", "廠牌1", "即時庫存", "平均耗用"]].rename(columns={"廠牌1": "廠牌"})
-        st.dataframe(
-            style_banded(simple_df, big_bold_col="即時庫存", bold_cols=["平均耗用"]),
-            use_container_width=True, hide_index=True,
-            height=min(len(simple_df) * 35 + 38, 700),
-        )
-        st.caption(f"共 {len(df)} 個品項 — {selected_clinic}（簡化檢視｜叫貨/匯出請關閉簡化檢視）")
+        render_stock_table(simple_df, list(simple_df.columns), pinned=0, abn_flags=None, zoom_pct=zoom_pct)
+        st.caption(f"共 {len(df)} 個品項 — {selected_clinic}（簡化檢視｜匯出請關閉簡化檢視）")
         return
 
-    # ── 主表格（data_editor）──
+    # ── 主表格（HTML，純顯示）──
+    # 左側固定：品項、廠牌1、廠牌2、即時庫存、平均耗用；右側尾端：…耗、盤、進(~今)、建議叫貨、櫃位、分類
     inv_col_names = [c[0] for c in inv_col_specs]
-    visible_cols = ["品項", "廠牌1", "即時庫存", "平均耗用"] + inv_col_names + ["建議叫貨", "叫貨", "狀態", "分類", "櫃位", "廠牌2"]
-    df_display_ordered = df_display[visible_cols]
+    visible_cols = ["品項", "廠牌1", "廠牌2", "即時庫存", "平均耗用"] + inv_col_names + ["建議叫貨", "櫃位", "分類"]
 
-    col_config = {
-        "品項": st.column_config.TextColumn(disabled=True, pinned="left", width="medium"),
-        "廠牌1": st.column_config.TextColumn("廠牌", disabled=True, pinned="left", width="small"),
-        "即時庫存": st.column_config.NumberColumn("⭐ 即時庫存", disabled=True, format="%.1f",
-                                              pinned="left", width="small"),
-        "分類": st.column_config.TextColumn(disabled=True, width="small"),
-        "櫃位": st.column_config.TextColumn(disabled=True, width="small"),
-        "廠牌2": st.column_config.TextColumn(disabled=True, width="small"),
-        "平均耗用": st.column_config.NumberColumn(disabled=True, format="%.1f", pinned="left", width="small"),
-        "狀態": st.column_config.TextColumn("狀態", disabled=True, width=60,
-                                          help="🔴 = 最近一次耗用異常（為負數，或超過平均耗用×該分類閾值）"),
-        "建議叫貨": st.column_config.NumberColumn(disabled=True, format="%.1f", width="small"),
-        "叫貨": st.column_config.NumberColumn("叫貨 ✏️", min_value=0, format="%.1f", width="small"),
-    }
-    for col_name, ctype, _ in inv_col_specs:
-        if ctype == "inv":
-            sd_label = col_name[1:-1]  # "盤(03/24)" -> "(03/24)" but we want display
-            col_config[col_name] = st.column_config.NumberColumn(
-                f"📋{col_name}", disabled=True, format="%.1f", width="small")
-        else:
-            col_config[col_name] = st.column_config.NumberColumn(disabled=True, format="%.1f", width="small")
-
-    st.caption(f"💡 表格可左右拉動，「品項＋廠牌＋即時庫存＋平均耗用」會固定在左側；狀態欄 🔴 = 最近一次耗用異常。")
-    edited_stock_df = st.data_editor(
-        df_display_ordered, use_container_width=True, hide_index=True,
-        height=min(len(df_display_ordered) * 35 + 38, 700),
-        column_config=col_config, key="stock_editor",
-    )
-
-    # 送出叫貨
-    order_items = edited_stock_df[edited_stock_df["叫貨"].fillna(0) > 0]
-    if not order_items.empty:
-        st.markdown(f"**共 {len(order_items)} 項需要叫貨**")
-        if st.button("🛒 送出叫貨清單", type="primary"):
-            order_data = order_items[["品項", "分類", "廠牌1", "即時庫存", "叫貨"]].copy()
-            order_data.columns = ["品項", "分類", "廠牌", "目前庫存", "叫貨數量"]
-
-            st.subheader("叫貨清單")
-            for bname, group in order_data.groupby("廠牌"):
-                if not bname or bname == "-":
-                    bname = "未指定"
-                st.markdown(f"### 【{bname}】")
-                st.dataframe(group[["品項", "叫貨數量"]], use_container_width=True, hide_index=True)
-
-            buf = _build_order_excel(order_data)
-            st.download_button("📥 下載叫貨單 (.xlsx)", data=buf,
-                file_name=f"叫貨單_{selected_clinic}_{date.today()}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True)
+    st.caption("💡 上下兩條捲軸皆可左右拉動，載入時自動停在最右（最新盤點）；左側 5 欄固定。"
+               "紅色粗體 = 該次耗用異常（為負數，或超過平均耗用×該分類閾值）。")
+    render_stock_table(df_display, visible_cols, pinned=5, abn_flags=abn_flags, zoom_pct=zoom_pct)
+    if st.button("🔄 重新讀取資料", help="資料已快取 10 分鐘；盤點/進退貨/改錯存檔後會自動更新，若懷疑畫面過期可手動重讀"):
+        invalidate_stock_cache()
+        st.rerun()
 
     # 匯出庫存表（取最近 3 次盤點 + 進貨）
     st.divider()
@@ -2591,6 +2799,7 @@ def page_items():
                             cs_changes["is_active"] = bool(new["啟用"])
 
                         if cs_changes:
+                            invalidate_stock_cache()
                             sb.table("clinic_stock").update(cs_changes).eq(
                                 "product_id", pid).eq("clinic_id", clinic_id).execute()
                             updated += 1
@@ -2654,6 +2863,7 @@ def page_items():
 
                         # 為兩間診所建立 clinic_stock（含廠牌）
                         for c in sb.table("clinics").select("id").execute().data:
+                            invalidate_stock_cache()
                             sb.table("clinic_stock").insert({
                                 "product_id": pid, "clinic_id": c["id"],
                                 "current_stock": 0,
@@ -2690,13 +2900,16 @@ def page_analytics():
     consumed_per_clinic = {}
     product_info = {}
     has_any = False
+    cat_params = build_category_params(load_categories())
+    k_dates, n_max = avg_window_dates(cat_params), max_avg_window(cat_params)
     for cid in clinic_ids:
-        clinic_logs = fetch_all(sb.table("inventory_logs").select(
-            "id, product_id, consumed_qty, log_date, products(name, category_id, categories(name), units(name))"
-        ).eq("clinic_id", cid).order("log_date", desc=True).order("id", desc=True))
+        clinic_logs, win_start = load_recent_logs(
+            int(cid), k_dates,
+            "id, product_id, consumed_qty, log_date, products(name, category_id, categories(name), units(name))",
+        )
         if clinic_logs:
             has_any = True
-        consumed_per_clinic[cid] = build_recent_consumed_map(clinic_logs, n=6)
+        consumed_per_clinic[cid] = build_recent_consumed_map(clinic_logs, n=n_max, window_start=win_start)
         for log in clinic_logs:
             pid = log["product_id"]
             if pid not in product_info:
@@ -2714,7 +2927,9 @@ def page_analytics():
     product_consumed_all = defaultdict(list)
     for cid in clinic_ids:
         for pid, vals in consumed_per_clinic[cid].items():
-            product_consumed_all[pid].extend(vals)
+            info = product_info.get(pid) or {}
+            n_cat = cat_params.get(info.get("category"), DEFAULT_CAT_PARAMS)["avg_n"]
+            product_consumed_all[pid].extend(vals[:n_cat])
 
     # ── 診斷區（admin 限定，用於排查耗用/建議叫貨計算問題）──
     user_role = st.session_state.user.get("role")
@@ -2797,13 +3012,13 @@ def page_analytics():
         reorder_rows = []
         for cid in clinic_ids:
             for pid, consumed_list in consumed_per_clinic[cid].items():
-                avg = calc_avg_consumption(consumed_list)
-                if avg <= 0:
-                    continue
                 info = product_info.get(pid)
                 if not info:
                     continue
                 params = cat_params.get(info["category"], DEFAULT_CAT_PARAMS)
+                avg = calc_avg_consumption(consumed_list, max_n=params["avg_n"])
+                if avg <= 0:
+                    continue
                 current = stock_map.get((pid, cid), 0)
                 if current < avg * params["safety"]:
                     reorder_rows.append({
@@ -2839,9 +3054,10 @@ def page_analytics():
             positive = [v for v in consumed_list if v > 0]
             total = sum(positive)
             if total > 0:
+                n_cat = cat_params.get(info["category"], DEFAULT_CAT_PARAMS)["avg_n"]
                 ranking.append({"品項": info["name"], "分類": info["category"],
                                 "總耗用量": round(total, 1),
-                                "平均耗用": round(calc_avg_consumption(consumed_list), 1)})
+                                "平均耗用": round(calc_avg_consumption(consumed_list, max_n=n_cat), 1)})
 
         if ranking:
             rank_df = pd.DataFrame(ranking).sort_values("總耗用量", ascending=False).reset_index(drop=True)
@@ -3002,10 +3218,9 @@ def page_order():
     ).execute().data
     products = sort_products_by_bopomofo(products, cs_map=cs_map)
 
-    logs = fetch_all(sb.table("inventory_logs").select(
-        "product_id, consumed_qty, log_date"
-    ).eq("clinic_id", clinic_id).order("log_date", desc=True))
-    consumed_data = build_recent_consumed_map(logs, n=6)
+    logs, win_start = load_recent_logs(int(clinic_id), avg_window_dates(cat_params),
+                                       "id, product_id, consumed_qty, log_date")
+    consumed_data = build_recent_consumed_map(logs, n=max_avg_window(cat_params), window_start=win_start)
 
     st.subheader("步驟一：編輯叫貨清單")
     show_all = st.checkbox("顯示所有品項", value=False)
@@ -3017,8 +3232,8 @@ def page_order():
             continue
 
         current = float(cs["current_stock"])
-        avg = calc_avg_consumption(consumed_data.get(p["id"], []))
         params = cat_params.get(p["categories"]["name"], DEFAULT_CAT_PARAMS)
+        avg = calc_avg_consumption(consumed_data.get(p["id"], []), max_n=params["avg_n"])
         auto = avg > 0 and current < avg * params["safety"]
         suggested = max(0, round(avg * params["multiplier"] - current, 1)) if auto else 0
 
@@ -3122,13 +3337,17 @@ def page_settings():
     # ── 參數（各分類獨立）──
     with tab_params:
         st.subheader("各分類參數設定")
-        st.caption("每個分類可獨立設定；計算「建議叫貨」與「異常耗用提醒」時，會套用該品項所屬分類的數值。")
+        st.caption("每個分類可獨立設定；計算「平均耗用」「建議叫貨」與「異常耗用提醒」時，會套用該品項所屬分類的數值。")
         param_cats = load_categories()
+        avg_col_missing = all(c.get("avg_window") is None for c in param_cats)
+        if avg_col_missing:
+            st.warning("尚未執行 migration_v7_avg_window.sql：「平均耗用計算次數」暫以預設 6 次計算，且無法儲存。"
+                       "請在 Supabase SQL Editor 執行該腳本後再設定。")
         with st.form("cat_params_form"):
             new_params = {}
             for c in param_cats:
                 st.markdown(f"**{c['name']}**")
-                pc1, pc2, pc3 = st.columns(3)
+                pc1, pc2, pc3, pc4 = st.columns(4)
                 with pc1:
                     m = st.number_input("目標庫存備貨倍數",
                                         value=float(c.get("stock_target_multiplier") or DEFAULT_CAT_PARAMS["multiplier"]),
@@ -3141,15 +3360,24 @@ def page_settings():
                     sfa = st.number_input("建議叫貨安全係數",
                                           value=float(c.get("safety_factor") or DEFAULT_CAT_PARAMS["safety"]),
                                           min_value=0.0, step=0.1, format="%.1f", key=f"cp_s_{c['id']}")
+                with pc4:
+                    n_avg = st.number_input("平均耗用計算次數（近 N 次）",
+                                            value=int(c.get("avg_window") or DEFAULT_AVG_WINDOW),
+                                            min_value=1, max_value=24, step=1, key=f"cp_n_{c['id']}",
+                                            disabled=avg_col_missing,
+                                            help="平均耗用 = 該品項最近 N 次盤點的耗用平均（首次盤點不計、負數當 0）")
                 new_params[c["id"]] = {
                     "stock_target_multiplier": m,
                     "anomaly_threshold": t,
                     "safety_factor": sfa,
                 }
+                if not avg_col_missing:
+                    new_params[c["id"]]["avg_window"] = int(n_avg)
             if st.form_submit_button("儲存全部分類", type="primary"):
                 for cid, vals in new_params.items():
                     sb.table("categories").update(vals).eq("id", cid).execute()
                 load_categories.clear()
+                invalidate_stock_cache()
                 st.success("已更新所有分類參數")
 
     # ── 分類 ──
