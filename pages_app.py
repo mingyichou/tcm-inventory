@@ -4,6 +4,8 @@ v2: per-clinic 廠牌/啟用、整數數量、庫存日期欄、盤點歷史可�
 """
 
 import io
+import math
+import hashlib
 import streamlit as st
 import pandas as pd
 from datetime import date, datetime, timedelta
@@ -115,6 +117,8 @@ def short_date(d: str) -> str:
 # 顯示時 0 視為空白的欄位（活動量類，不含庫存盤點數）
 ZERO_HIDE_PATTERNS = ("進(", "耗(", "進貨", "耗用")
 ZERO_HIDE_EXACT = {"建議叫貨", "叫貨", "平均耗用", "建議數量", "叫貨數量"}
+# 以整數顯示的欄位（建議叫貨為四捨五入後的整數）
+INT_DISPLAY_COLS = {"建議叫貨", "建議數量"}
 
 
 def _should_hide_zero(col_name) -> bool:
@@ -162,10 +166,11 @@ def style_banded(df, highlight_col=None, bold_cols=None, big_bold_col=None):
     num_cols = df.select_dtypes(include=["number", "float", "int"]).columns.tolist()
     fmt = {}
     for c in num_cols:
+        dec = 0 if c in INT_DISPLAY_COLS else 1
         if c in hide_zero_cols:
-            fmt[c] = lambda v: "" if pd.isna(v) or v == 0 else f"{v:.1f}"
+            fmt[c] = lambda v, d=dec: "" if pd.isna(v) or v == 0 else f"{v:.{d}f}"
         else:
-            fmt[c] = lambda v: "" if pd.isna(v) else f"{v:.1f}"
+            fmt[c] = lambda v, d=dec: "" if pd.isna(v) else f"{v:.{d}f}"
     return df.style.apply(row_style, axis=1).format(fmt)
 
 
@@ -185,22 +190,29 @@ def load_products():
 def load_brands():
     return with_retry(lambda: get_supabase_client().table("brands").select("id, name").order("id").execute().data)
 
+# migration_v8 新增：依櫃位 A/B/C/D 分別設定的倍數 / 係數
+CATEGORY_V8_COLS = ("by_cabinet", "multiplier_a", "multiplier_b", "multiplier_c", "multiplier_d",
+                    "safety_a", "safety_b", "safety_c", "safety_d")
+
+
 @st.cache_data(ttl=30)
 def load_categories():
     base_cols = ("id, name, default_unit_id, default_spec_note, "
-                 "stock_target_multiplier, anomaly_threshold, safety_factor")
+                 "stock_target_multiplier, safety_factor")
 
     def _query(cols):
         return with_retry(lambda: get_supabase_client().table("categories").select(cols).order("id").execute().data)
 
     try:
-        return _query(base_cols + ", avg_window")
+        return _query(base_cols + ", " + ", ".join(CATEGORY_V8_COLS))
     except Exception:
-        # migration_v7_avg_window.sql 尚未執行（沒有 avg_window 欄位）→ 以 None 代表「未設定」，計算時套預設 6
-        data = _query(base_cols)
-        for c in data:
-            c["avg_window"] = None
-        return data
+        # migration_v8_cabinet_params.sql 尚未執行（沒有依櫃位欄位）→ 不帶 v8 欄位，計算時一律不分櫃位
+        return _query(base_cols)
+
+
+def categories_v8_missing(cats: list) -> bool:
+    """True = 尚未執行 migration_v8（分類列沒有 by_cabinet 欄位）。"""
+    return bool(cats) and all("by_cabinet" not in c for c in cats)
 
 @st.cache_data(ttl=30)
 def load_units():
@@ -348,40 +360,99 @@ def build_recent_consumed_map(logs_desc: list, n: int = 6, window_start: str | N
     return result
 
 
-# 分類參數預設值（migration_v4 之前的全域值；avg_n 為 migration_v7 新增）
+# ── 參數 ──
+# 全域參數（system_settings，migration_v8 起）：平均耗用計算次數、異常耗用警示閾值
 DEFAULT_AVG_WINDOW = 6
-DEFAULT_CAT_PARAMS = {"multiplier": 2.0, "threshold": 1.5, "safety": 1.2, "avg_n": DEFAULT_AVG_WINDOW}
+DEFAULT_THRESHOLD = 1.5
+# 分類參數預設值（不分櫃位）：目標庫存備貨倍數、建議叫貨安全係數
+DEFAULT_CAT_PARAMS = {"multiplier": 2.0, "safety": 1.2}
+# 櫃位群組：取櫃位第一個字母；空白或非 A–D 開頭一律比照 B
+CABINET_GROUPS = ("A", "B", "C", "D")
+DEFAULT_CABINET_GROUP = "B"
 
 # 庫存頁顯示的盤點次數（盤/進/耗 欄）
 MAX_DISPLAY_DATES = 6
 
 
-def build_category_params(categories: list) -> dict:
-    """{分類名稱: {"multiplier","threshold","safety","avg_n"}}；缺值套用全域預設。
-    multiplier=目標庫存備貨倍數、threshold=異常耗用警示閾值、safety=建議叫貨安全係數、
-    avg_n=平均耗用計算次數（近 N 次盤點）。"""
-    def _f(v, d):
-        return float(v) if v not in (None, "") else d
+def cabinet_group(cabinet) -> str:
+    """櫃位 → 群組字母。A、A2、A70 → A；空白或非 A–D 開頭 → B（不改動櫃位欄位本身）。"""
+    s = (cabinet or "").strip().upper()
+    return s[0] if s and s[0] in CABINET_GROUPS else DEFAULT_CABINET_GROUP
+
+
+@st.cache_data(ttl=30)
+def load_global_params() -> dict:
+    """全域參數：avg_n=平均耗用計算次數（近 N 次盤點）、threshold=異常耗用警示閾值（倍數）。
+    存於 system_settings（key/value）；缺值套預設。"""
+    rows = with_retry(lambda: get_supabase_client().table("system_settings").select("key, value").execute().data)
+    kv = {r["key"]: r["value"] for r in rows}
+
+    def _get(key, default, cast):
+        try:
+            return cast(kv[key])
+        except (KeyError, TypeError, ValueError):
+            return default
+
     return {
-        c["name"]: {
-            "multiplier": _f(c.get("stock_target_multiplier"), DEFAULT_CAT_PARAMS["multiplier"]),
-            "threshold": _f(c.get("anomaly_threshold"), DEFAULT_CAT_PARAMS["threshold"]),
-            "safety": _f(c.get("safety_factor"), DEFAULT_CAT_PARAMS["safety"]),
-            "avg_n": max(1, int(_f(c.get("avg_window"), DEFAULT_AVG_WINDOW))),
-        }
-        for c in categories
+        "avg_n": max(1, _get("avg_window", DEFAULT_AVG_WINDOW, lambda v: int(float(v)))),
+        "threshold": _get("anomaly_threshold", DEFAULT_THRESHOLD, float),
     }
 
 
-def max_avg_window(cat_params: dict) -> int:
-    """各分類「平均耗用計算次數」的最大值。"""
-    return max([p["avg_n"] for p in cat_params.values()] + [DEFAULT_AVG_WINDOW])
+def save_global_params(avg_n: int, threshold: float) -> None:
+    sb = get_supabase_client()
+    sb.table("system_settings").upsert([
+        {"key": "avg_window", "value": str(int(avg_n)), "description": "平均耗用計算次數（近 N 次盤點）"},
+        {"key": "anomaly_threshold", "value": str(float(threshold)), "description": "異常耗用警示閾值（倍數）"},
+    ]).execute()
+    load_global_params.clear()
 
 
-def avg_window_dates(cat_params: dict) -> int:
-    """需要抓取的盤點日期數：max(顯示次數, 最大平均耗用計算次數 + 1)。
+def build_category_params(categories: list) -> dict:
+    """{分類名稱: {"multiplier","safety","by_cabinet","multiplier_cab":{A..D},"safety_cab":{A..D}}}；缺值套預設。
+    multiplier=目標庫存備貨倍數、safety=建議叫貨安全係數（不分櫃位值）；
+    by_cabinet=True 時改用 *_cab 依櫃位群組取值（migration_v8）。"""
+    def _f(v, d):
+        return float(v) if v not in (None, "") else d
+    out = {}
+    for c in categories:
+        m = _f(c.get("stock_target_multiplier"), DEFAULT_CAT_PARAMS["multiplier"])
+        s = _f(c.get("safety_factor"), DEFAULT_CAT_PARAMS["safety"])
+        out[c["name"]] = {
+            "multiplier": m,
+            "safety": s,
+            "by_cabinet": bool(c.get("by_cabinet")),
+            "multiplier_cab": {g: _f(c.get(f"multiplier_{g.lower()}"), m) for g in CABINET_GROUPS},
+            "safety_cab": {g: _f(c.get(f"safety_{g.lower()}"), s) for g in CABINET_GROUPS},
+        }
+    return out
+
+
+def effective_params(cat_params: dict, cat_name: str, cabinet) -> tuple[float, float]:
+    """回傳該品項適用的 (目標庫存備貨倍數, 建議叫貨安全係數)：分類開啟「依櫃位」時依櫃位群組取值。"""
+    p = cat_params.get(cat_name)
+    if not p:
+        return DEFAULT_CAT_PARAMS["multiplier"], DEFAULT_CAT_PARAMS["safety"]
+    if p["by_cabinet"]:
+        g = cabinet_group(cabinet)
+        return p["multiplier_cab"][g], p["safety_cab"][g]
+    return p["multiplier"], p["safety"]
+
+
+def suggest_order_qty(avg_c: float, current: float, multiplier: float, safety: float) -> int:
+    """建議叫貨數量（整數）。
+    啟動條件：平均耗用 > 0 且 目前庫存 < 平均耗用 × 安全係數；
+    數量 = 四捨五入(平均耗用 × 備貨倍數 − 目前庫存)；結果 ≤ 0（例如 0.3 捨去成 0）就不建議，回傳 0。"""
+    if avg_c <= 0 or current >= avg_c * safety:
+        return 0
+    qty = math.floor(avg_c * multiplier - current + 0.5)
+    return int(qty) if qty > 0 else 0
+
+
+def avg_window_dates(avg_n: int) -> int:
+    """需要抓取的盤點日期數：max(顯示次數, 平均耗用計算次數 + 1)。
     +1 是因為每品項最早一筆（首盤 placeholder）會被排除，要多留一筆才湊得滿 N 次。"""
-    return max(MAX_DISPLAY_DATES, max_avg_window(cat_params) + 1)
+    return max(MAX_DISPLAY_DATES, int(avg_n) + 1)
 
 
 # ── 庫存頁資料快取 ──
@@ -644,6 +715,142 @@ def _build_stock_excel(df, clinic_name, recent_dates, product_log_map, tx_by_pro
 
 
 # ══════════════════════════════════════════════
+#  叫貨單：廠牌順序、分組、Excel 輸出
+# ══════════════════════════════════════════════
+# 步驟二／叫貨單的廠牌順序：固定前段 → 其他廠牌（依建立順序）→ 自研粉劑 → 未指定
+BRAND_ORDER_HEAD = ["莊松榮", "科達", "港香蘭", "天一", "順天堂", "大墩", "駿賀", "上賀漢聖"]
+BRAND_ORDER_TAIL = ["自研粉劑"]
+BRAND_UNSPECIFIED = "未指定"
+BRAND_NO_REORDER = "用完不補"  # 此廠牌的品項預設不勾選、不匯出
+ORDER_NO_OTHER = "（無）"  # 叫貨出表「其他廠牌」下拉的未選值（data_editor 會把缺值顯示成 "None"）
+
+
+def brand_order_key_map(brands: list) -> dict:
+    """{廠牌名稱: 排序鍵}；未列入固定清單的廠牌（含未來新增）排在固定前段之後、自研粉劑之前，依建立順序。"""
+    keys = {}
+    for i, name in enumerate(BRAND_ORDER_HEAD):
+        keys[name] = (0, i)
+    for b in sorted(brands, key=lambda b: b["id"]):
+        keys.setdefault(b["name"], (1, b["id"]))
+    for i, name in enumerate(BRAND_ORDER_TAIL):
+        keys[name] = (2, i)
+    keys[BRAND_UNSPECIFIED] = (3, 0)
+    return keys
+
+
+def group_order_items(items: list, brand_keys: dict) -> list:
+    """items: [{"品項","數量","category_id","廠牌"}, ...]（已依 分類→注音/櫃位 排序）。
+    回傳 [(廠牌名稱, [item, ...]), ...]：廠牌依 brand_order_key_map 排序；
+    廠牌為「用完不補」或數量 ≤ 0 者略過。各廠牌內維持原順序（分類順序 → 注音/櫃位）。"""
+    groups = defaultdict(list)
+    for it in items:
+        brand = it.get("廠牌") or BRAND_UNSPECIFIED
+        if brand == BRAND_NO_REORDER:
+            continue
+        try:
+            qty = float(it.get("數量") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty <= 0:
+            continue
+        groups[brand].append(it)
+    default_key = (1, 10 ** 9)
+    return sorted(groups.items(), key=lambda kv: brand_keys.get(kv[0], default_key))
+
+
+def resolve_order_brand(row) -> str:
+    """步驟一的廠牌三選一 → 出單廠牌：其他廠牌 > ✓2 > ✓1；三個都沒選（漏勾）以廠牌1 出單，沒有廠牌1 則「未指定」。"""
+    other = row.get("其他廠牌")
+    if isinstance(other, str) and other.strip() and other.strip() != ORDER_NO_OTHER:
+        return other.strip()
+    if row.get("✓2") and row.get("廠牌2"):
+        return row["廠牌2"]
+    if row.get("✓1") and row.get("廠牌1"):
+        return row["廠牌1"]
+    return row.get("廠牌1") or BRAND_UNSPECIFIED
+
+
+def roc_date_str(d: date) -> str:
+    """民國日期字串，例：2026-10-21 → 115/10/21（不補零，同範例）。"""
+    return f"{d.year - 1911}/{d.month}/{d.day}"
+
+
+def _build_order_excel(clinic_name: str, groups: list, order_date: date | None = None) -> bytes:
+    """叫貨單 Excel（格式依「叫貨單範例.xlsx」工作表1）：
+    第 1 列民國日期；每個廠牌一區塊：「{診所}中醫」、廠牌名稱、品項/數量每列 4 組（A/B、C/D、E/F、G/H）；
+    品項由左到右再換列，分類不同時換新列（不加分類標題）；區塊間空一列；全部同一工作表、不分頁。
+    groups: [(廠牌, [{"品項","數量","category_id"}, ...]), ...]（已排序）。數量為整數寫整數、有小數才寫小數。"""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, Border, Side
+    from openpyxl.worksheet.properties import PageSetupProperties
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "叫貨單"
+    font = Font(name="新細明體", size=12)
+    thin = Side(style="thin")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    item_align = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    qty_align = Alignment(horizontal="center", vertical="center")
+    for col, w in zip("ABCDEFGH", (13.9, 6.3, 12.7, 6.9, 12.7, 7.7, 12.7, 7.7)):
+        ws.column_dimensions[col].width = w
+
+    def put(r, c, v, align=None, boxed=False):
+        cell = ws.cell(row=r, column=c, value=v)
+        cell.font = font
+        if align is not None:
+            cell.alignment = align
+        if boxed:
+            cell.border = border
+        return cell
+
+    def qty_value(q):
+        try:
+            f = float(q)
+        except (TypeError, ValueError):
+            return q
+        return int(f) if f.is_integer() else round(f, 1)
+
+    r = 1
+    put(r, 1, roc_date_str(order_date or date.today()))
+    r += 1
+    for brand, items in groups:
+        put(r, 1, f"{clinic_name}中醫")
+        r += 1
+        put(r, 1, brand)
+        r += 1
+        slot = 0  # 本列已填入第幾組（0~3）
+        last_cat = None
+        for it in items:
+            cat = it.get("category_id")
+            if last_cat is not None and cat != last_cat and slot != 0:
+                r += 1  # 分類不同 → 換新列
+                slot = 0
+            last_cat = cat
+            if slot == 0:
+                for c in range(1, 9):  # 整列先畫框線（同範例：未填滿的格也有框）
+                    put(r, c, None, boxed=True)
+            put(r, slot * 2 + 1, it["品項"], item_align, boxed=True)
+            put(r, slot * 2 + 2, qty_value(it["數量"]), qty_align, boxed=True)
+            slot += 1
+            if slot == 4:
+                r += 1
+                slot = 0
+        if slot != 0:
+            r += 1
+        r += 1  # 區塊間空一列
+
+    ws.page_setup.orientation = "portrait"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ══════════════════════════════════════════════
 #  庫存表 HTML 渲染器
 # ══════════════════════════════════════════════
 # Why: Streamlit 內建表格（data_editor / dataframe）做不到行底色交替、每 5 行粗線、
@@ -656,7 +863,7 @@ STOCK_TEXT_COLS = {"品項", "廠牌", "廠牌1", "廠牌2", "分類", "櫃位"}
 
 
 def is_abnormal_consumed(consumed, avg_c: float, threshold: float) -> bool:
-    """單格耗用是否異常：為負數；或 平均耗用>0 且 耗用>平均×分類閾值 且 耗用>1（避免小量誤判）。"""
+    """單格耗用是否異常：為負數；或 平均耗用>0 且 耗用>平均×全域閾值 且 耗用>1（避免小量誤判）。"""
     if consumed is None:
         return False
     try:
@@ -676,8 +883,8 @@ def _stock_header_html(col_name: str) -> str:
     return _html.escape(str(col_name))
 
 
-def _fmt_cell(v) -> str:
-    """數值一律 1 位小數；None/NaN 顯示空白；文字跳脫。"""
+def _fmt_cell(v, int_col: bool = False) -> str:
+    """數值 1 位小數（int_col=True 時整數）；None/NaN 顯示空白；文字跳脫。"""
     if v is None:
         return ""
     if isinstance(v, str):
@@ -688,7 +895,7 @@ def _fmt_cell(v) -> str:
         return _html.escape(str(v))
     if pd.isna(f):
         return ""
-    return f"{f:.1f}"
+    return f"{f:.0f}" if int_col else f"{f:.1f}"
 
 
 _STOCK_TABLE_CSS = """
@@ -840,7 +1047,7 @@ def render_stock_table(df: pd.DataFrame, columns: list, pinned: int, abn_flags: 
                 cls.append("sug")
             if c in flags:
                 cls.append("abn")
-            cells.append(f'<td class="{" ".join(cls)}">{_fmt_cell(v)}</td>')
+            cells.append(f'<td class="{" ".join(cls)}">{_fmt_cell(v, int_col=c in INT_DISPLAY_COLS)}</td>')
         body.append(f'<tr class="{row_cls}">' + "".join(cells) + "</tr>")
 
     # 初始高度估算（JS 取得視窗高度後會再調整）
@@ -929,13 +1136,14 @@ def page_stock_overview():
     all_names = tuple(p["name"] for p in products)
     key_index = build_bopomofo_index(all_names)
 
-    # 載入各分類參數（備貨倍數 / 異常閾值 / 安全係數 / 平均耗用計算次數）
+    # 載入參數：全域（平均耗用計算次數 / 異常閾值）＋ 各分類（備貨倍數 / 安全係數，可依櫃位）
+    gp = load_global_params()
     cat_params = build_category_params(categories)
 
-    # 載入盤點紀錄：只抓近 K 次盤點日期（K = max(顯示 6 次, 最大平均耗用計算次數 + 1)），快取
+    # 載入盤點紀錄：只抓近 K 次盤點日期（K = max(顯示 6 次, 平均耗用計算次數 + 1)），快取
     try:
         all_logs, window_start = load_recent_logs(
-            int(clinic_id), avg_window_dates(cat_params),
+            int(clinic_id), avg_window_dates(gp["avg_n"]),
             "id, product_id, current_count_qty, consumed_qty, log_date, session_id",
         )
         all_tx = load_transactions_since(int(clinic_id), window_start)
@@ -946,9 +1154,8 @@ def page_stock_overview():
             st.rerun()
         return
 
-    # 每品項近 N 次耗用（負數當 0，含 0 算分母；N 依分類，先取最大 N，計算時再依分類截取）
-    consumed_recent_map = build_recent_consumed_map(all_logs, n=max_avg_window(cat_params),
-                                                    window_start=window_start)
+    # 每品項近 N 次耗用（負數當 0，含 0 算分母；N = 全域「平均耗用計算次數」）
+    consumed_recent_map = build_recent_consumed_map(all_logs, n=gp["avg_n"], window_start=window_start)
 
     # 取最近 MAX_DISPLAY_DATES 次不重複盤點日期（asc：舊→新）
     seen_d = set()
@@ -993,23 +1200,32 @@ def page_stock_overview():
     rows = []
     product_id_list = []
     abn_flags = []  # 與 rows 對齊：每列異常耗用的欄名集合
+    order_items = []  # 匯出叫貨單用：全部品項（不受分類/搜尋篩選）中建議叫貨 > 0 者，廠牌＝廠牌1
 
     for p in products:
         pid = p["id"]
         cs = cs_map.get(pid)
         if not cs or not cs.get("is_active", True):
             continue
-        if cat_filter != "全部" and p["categories"]["name"] != cat_filter:
+
+        cat_name = p["categories"]["name"]
+        current_stock = float(cs["current_stock"]) if cs else 0
+        recent_consumed = consumed_recent_map.get(pid, [])
+        avg_c = calc_avg_consumption(recent_consumed, max_n=gp["avg_n"])
+        multiplier, safety = effective_params(cat_params, cat_name, cs.get("cabinet"))
+        suggested = suggest_order_qty(avg_c, current_stock, multiplier, safety)
+        if suggested > 0:
+            order_items.append({
+                "品項": p["name"], "數量": suggested, "category_id": p.get("category_id"),
+                "廠牌": brand_map.get(cs.get("brand1_id")) or BRAND_UNSPECIFIED,
+            })
+
+        if cat_filter != "全部" and cat_name != cat_filter:
             continue
         if search and not match_search(p["name"], key_index.get(p["name"], ("", "")), search):
             continue
 
         p_logs = product_log_map.get(pid, {})
-        cat_name = p["categories"]["name"]
-        params = cat_params.get(cat_name, DEFAULT_CAT_PARAMS)
-        current_stock = float(cs["current_stock"]) if cs else 0
-        recent_consumed = consumed_recent_map.get(pid, [])
-        avg_c = calc_avg_consumption(recent_consumed, max_n=params["avg_n"])
         abn_cols = set()  # 此列中耗用異常的欄名（含歷史；修正盤點數/進退貨後重算即消失）
 
         row = {
@@ -1044,7 +1260,7 @@ def page_stock_overview():
                     consumed = round(float(lg_a["current_count_qty"]) + restock - float(lg_b["current_count_qty"]), 1)
                     row[col_name] = consumed
                     # 每一格耗用都套用異常規則（不只最近一次），以紅色粗體標示
-                    if is_abnormal_consumed(consumed, avg_c, params["threshold"]):
+                    if is_abnormal_consumed(consumed, avg_c, gp["threshold"]):
                         abn_cols.add(col_name)
                 else:
                     row[col_name] = None
@@ -1053,11 +1269,6 @@ def page_stock_overview():
                     float(t["change_qty"]) for t in tx_by_product.get(pid, [])
                     if t["tx_date"] > meta
                 ), 1)
-
-        if avg_c > 0 and current_stock < avg_c * params["safety"]:
-            suggested = max(0, round(avg_c * params["multiplier"] - current_stock, 1))
-        else:
-            suggested = 0
 
         row["即時庫存"] = current_stock
         row["平均耗用"] = round(avg_c, 1)
@@ -1087,25 +1298,39 @@ def page_stock_overview():
     visible_cols = ["品項", "廠牌1", "廠牌2", "即時庫存", "平均耗用"] + inv_col_names + ["建議叫貨", "櫃位", "分類"]
 
     st.caption("💡 上下兩條捲軸皆可左右拉動，載入時自動停在最右（最新盤點）；左側 5 欄固定。"
-               "紅色粗體 = 該次耗用異常（為負數，或超過平均耗用×該分類閾值）。")
+               "紅色粗體 = 該次耗用異常（為負數，或超過平均耗用×警示閾值）。")
     render_stock_table(df_display, visible_cols, pinned=5, abn_flags=abn_flags, zoom_pct=zoom_pct)
     if st.button("🔄 重新讀取資料", help="資料已快取 10 分鐘；盤點/進退貨/改錯存檔後會自動更新，若懷疑畫面過期可手動重讀"):
         invalidate_stock_cache()
         st.rerun()
 
-    # 匯出庫存表（取最近 3 次盤點 + 進貨）
+    # 匯出：庫存表（取最近 3 次盤點 + 進貨）／叫貨單（全部品項的建議叫貨 × 廠牌1，不受篩選）
     st.divider()
-    if st.button("📥 匯出庫存表 (.xlsx)", use_container_width=True):
-        # 最近 3 個盤點日期（舊→新）
-        recent_dates = all_dates[-3:] if all_dates else []
-        buf = _build_stock_excel(df, selected_clinic, recent_dates,
-                                  product_log_map, tx_by_product, cs_map, brand_map)
+    exp1, exp2 = st.columns(2)
+    with exp1:
+        if st.button("📥 匯出庫存表 (.xlsx)", use_container_width=True):
+            # 最近 3 個盤點日期（舊→新）
+            recent_dates = all_dates[-3:] if all_dates else []
+            buf = _build_stock_excel(df, selected_clinic, recent_dates,
+                                      product_log_map, tx_by_product, cs_map, brand_map)
+            st.download_button(
+                "📥 下載庫存表",
+                data=buf,
+                file_name=f"庫存表_{selected_clinic}_{date.today()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True, type="primary",
+            )
+    with exp2:
+        order_groups = group_order_items(order_items, brand_order_key_map(brands_data))
+        n_order = sum(len(items) for _, items in order_groups)
         st.download_button(
-            "📥 下載庫存表",
-            data=buf,
-            file_name=f"庫存表_{selected_clinic}_{date.today()}.xlsx",
+            f"📥 匯出叫貨單 (.xlsx)　{len(order_groups)} 個廠牌 / {n_order} 項",
+            data=_build_order_excel(selected_clinic, order_groups),
+            file_name=f"叫貨單_{selected_clinic}_{date.today()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True, type="primary",
+            use_container_width=True, disabled=n_order == 0,
+            help="全部品項（不受上方分類/搜尋篩選）中建議叫貨 > 0 者：數量＝建議叫貨、廠牌＝廠牌1；"
+                 "廠牌1 為「用完不補」者不列入。要調整數量或廠牌請到「叫貨出表」。",
         )
 
     # 改錯存檔
@@ -2900,8 +3125,9 @@ def page_analytics():
     consumed_per_clinic = {}
     product_info = {}
     has_any = False
+    gp = load_global_params()
     cat_params = build_category_params(load_categories())
-    k_dates, n_max = avg_window_dates(cat_params), max_avg_window(cat_params)
+    k_dates, n_max = avg_window_dates(gp["avg_n"]), gp["avg_n"]
     for cid in clinic_ids:
         clinic_logs, win_start = load_recent_logs(
             int(cid), k_dates,
@@ -2927,9 +3153,7 @@ def page_analytics():
     product_consumed_all = defaultdict(list)
     for cid in clinic_ids:
         for pid, vals in consumed_per_clinic[cid].items():
-            info = product_info.get(pid) or {}
-            n_cat = cat_params.get(info.get("category"), DEFAULT_CAT_PARAMS)["avg_n"]
-            product_consumed_all[pid].extend(vals[:n_cat])
+            product_consumed_all[pid].extend(vals[:n_max])
 
     # ── 診斷區（admin 限定，用於排查耗用/建議叫貨計算問題）──
     user_role = st.session_state.user.get("role")
@@ -3000,14 +3224,14 @@ def page_analytics():
     tab_reorder, tab_ranking, tab_cabinet = st.tabs(["📦 建議叫貨", "🏆 常用排名", "🗄️ 櫃位分類"])
 
     with tab_reorder:
-        cat_params = build_category_params(load_categories())
-
         stock_data = []
         for cid in clinic_ids:
-            resp = sb.table("clinic_stock").select("product_id, current_stock, clinic_id").eq("clinic_id", cid).execute()
+            resp = sb.table("clinic_stock").select(
+                "product_id, current_stock, clinic_id, cabinet"
+            ).eq("clinic_id", cid).execute()
             stock_data.extend(resp.data)
 
-        stock_map = {(s["product_id"], s["clinic_id"]): float(s["current_stock"]) for s in stock_data}
+        stock_map = {(s["product_id"], s["clinic_id"]): s for s in stock_data}
 
         reorder_rows = []
         for cid in clinic_ids:
@@ -3015,17 +3239,19 @@ def page_analytics():
                 info = product_info.get(pid)
                 if not info:
                     continue
-                params = cat_params.get(info["category"], DEFAULT_CAT_PARAMS)
-                avg = calc_avg_consumption(consumed_list, max_n=params["avg_n"])
+                avg = calc_avg_consumption(consumed_list, max_n=n_max)
                 if avg <= 0:
                     continue
-                current = stock_map.get((pid, cid), 0)
-                if current < avg * params["safety"]:
+                cs = stock_map.get((pid, cid)) or {}
+                current = float(cs.get("current_stock") or 0)
+                multiplier, safety = effective_params(cat_params, info["category"], cs.get("cabinet"))
+                suggested = suggest_order_qty(avg, current, multiplier, safety)
+                if suggested > 0:
                     reorder_rows.append({
                         "診所": "澤豐" if cid == 1 else "澤沛",
                         "品項": info["name"], "分類": info["category"],
                         "目前庫存": current, "平均耗用": round(avg, 1),
-                        "建議叫貨": max(0, round(avg * params["multiplier"] - current, 1)),
+                        "建議叫貨": suggested,
                     })
 
         if reorder_rows:
@@ -3054,10 +3280,9 @@ def page_analytics():
             positive = [v for v in consumed_list if v > 0]
             total = sum(positive)
             if total > 0:
-                n_cat = cat_params.get(info["category"], DEFAULT_CAT_PARAMS)["avg_n"]
                 ranking.append({"品項": info["name"], "分類": info["category"],
                                 "總耗用量": round(total, 1),
-                                "平均耗用": round(calc_avg_consumption(consumed_list, max_n=n_cat), 1)})
+                                "平均耗用": round(calc_avg_consumption(consumed_list, max_n=n_max), 1)})
 
         if ranking:
             rank_df = pd.DataFrame(ranking).sort_values("總耗用量", ascending=False).reset_index(drop=True)
@@ -3187,6 +3412,50 @@ def page_analytics():
 #  6. 叫貨出表（per-clinic 廠牌）
 # ══════════════════════════════════════════════
 
+ORDER_EDIT_COLS = ["勾選", "品項", "平均耗用", "最近耗用", "目前庫存", "櫃位", "建議數量", "數量",
+                   "廠牌1", "✓1", "廠牌2", "✓2", "其他廠牌"]
+ORDER_BRAND_COLS = ("✓1", "✓2", "其他廠牌")
+
+
+def _apply_order_edits(ed_key: str, index_labels: list) -> None:
+    """步驟一 data_editor 的 on_change：把編輯寫回 session_state.order_df，並處理廠牌三選一。
+    勾 ✓1 → 取消 ✓2、清空其他廠牌；勾 ✓2 → 取消 ✓1、清空其他廠牌；選其他廠牌 → 取消 ✓1、✓2。
+    廠牌欄有變動時提高 order_ver，讓表格以更新後的資料重建（畫面才看得到自動取消）。"""
+    state = st.session_state.get(ed_key) or {}
+    edited_rows = state.get("edited_rows") or {}
+    if not edited_rows:
+        return
+    df = st.session_state.order_df
+    brand_touched = False
+    for pos, changes in edited_rows.items():
+        try:
+            label = index_labels[int(pos)]
+        except (IndexError, ValueError, TypeError):
+            continue
+        for col, val in changes.items():
+            if col not in df.columns:
+                continue
+            if col == "其他廠牌" and (val is None or not str(val).strip()):
+                val = ORDER_NO_OTHER
+            if col == "✓1" and val:
+                df.loc[label, "✓2"] = False
+                df.loc[label, "其他廠牌"] = ORDER_NO_OTHER
+            elif col == "✓2" and val:
+                df.loc[label, "✓1"] = False
+                df.loc[label, "其他廠牌"] = ORDER_NO_OTHER
+            elif col == "其他廠牌" and val != ORDER_NO_OTHER:
+                df.loc[label, "✓1"] = False
+                df.loc[label, "✓2"] = False
+            if col in ORDER_BRAND_COLS:
+                brand_touched = True
+            if col == "數量" and val is None:
+                val = 0.0
+            df.loc[label, col] = val
+    st.session_state.order_df = df
+    if brand_touched:
+        st.session_state.order_ver = st.session_state.get("order_ver", 0) + 1
+
+
 def page_order():
     st.header("🛒 叫貨出表")
 
@@ -3199,116 +3468,153 @@ def page_order():
     if not clinic_id:
         return
 
-    sb = get_supabase_client()
-
+    gp = load_global_params()
     cat_params = build_category_params(load_categories())
-
     brands = load_brands()
     brand_map = {b["id"]: b["name"] for b in brands}
-    brand_names = [b["name"] for b in brands]
+    brand_keys = brand_order_key_map(brands)
+    brand_options = sorted(brand_map.values(), key=lambda n: brand_keys.get(n, (1, 10 ** 9)))
 
-    # per-clinic 資料（先載入以排序）
-    cs_data = sb.table("clinic_stock").select(
-        "product_id, current_stock, brand1_id, is_active, cabinet"
-    ).eq("clinic_id", clinic_id).execute().data
+    try:
+        cs_data, products = load_stock_snapshot(int(clinic_id))
+        logs, win_start = load_recent_logs(int(clinic_id), avg_window_dates(gp["avg_n"]),
+                                           "id, product_id, consumed_qty, log_date")
+    except NETWORK_ERRORS:
+        st.error("連線資料庫逾時（已自動重試 3 次）。請稍候按下方「重新讀取資料」，或檢查網路。")
+        if st.button("🔄 重新讀取資料", key="order_retry"):
+            invalidate_stock_cache()
+            st.rerun()
+        return
     cs_map = {s["product_id"]: s for s in cs_data}
-
-    products = sb.table("products").select(
-        "id, name, category_id, categories(name), units(name)"
-    ).execute().data
     products = sort_products_by_bopomofo(products, cs_map=cs_map)
+    consumed_data = build_recent_consumed_map(logs, n=gp["avg_n"], window_start=win_start)
 
-    logs, win_start = load_recent_logs(int(clinic_id), avg_window_dates(cat_params),
-                                       "id, product_id, consumed_qty, log_date")
-    consumed_data = build_recent_consumed_map(logs, n=max_avg_window(cat_params), window_start=win_start)
-
-    st.subheader("步驟一：編輯叫貨清單")
-    show_all = st.checkbox("顯示所有品項", value=False)
-
-    order_rows = []
+    # ── 基礎清單（依 分類 → 注音/櫃位 排序）──
+    base_rows = []
     for p in products:
         cs = cs_map.get(p["id"])
         if not cs or not cs.get("is_active", True):
             continue
-
         current = float(cs["current_stock"])
-        params = cat_params.get(p["categories"]["name"], DEFAULT_CAT_PARAMS)
-        avg = calc_avg_consumption(consumed_data.get(p["id"], []), max_n=params["avg_n"])
-        auto = avg > 0 and current < avg * params["safety"]
-        suggested = max(0, round(avg * params["multiplier"] - current, 1)) if auto else 0
-
-        order_rows.append({
-            "勾選": auto, "品項": p["name"], "分類": p["categories"]["name"],
-            "單位": p["units"]["name"], "目前庫存": current,
-            "建議數量": suggested, "叫貨數量": suggested,
-            "廠牌": brand_map.get(cs.get("brand1_id"), ""),
+        cat_name = p["categories"]["name"]
+        recent = consumed_data.get(p["id"], [])
+        avg = calc_avg_consumption(recent, max_n=gp["avg_n"])
+        multiplier, safety = effective_params(cat_params, cat_name, cs.get("cabinet"))
+        suggested = suggest_order_qty(avg, current, multiplier, safety)
+        b1 = brand_map.get(cs.get("brand1_id")) or ""
+        b2 = brand_map.get(cs.get("brand2_id")) or ""
+        base_rows.append({
+            "_pid": p["id"], "_cat_id": p.get("category_id"), "_unit": (p.get("units") or {}).get("name", ""),
+            "勾選": bool(suggested > 0 and b1 != BRAND_NO_REORDER),
+            "品項": p["name"],
+            "平均耗用": round(avg, 1),
+            "最近耗用": round(float(recent[0]), 1) if recent else 0.0,
+            "目前庫存": current,
+            "櫃位": cs.get("cabinet") or "",
+            "建議數量": int(suggested),
+            "數量": float(suggested),
+            "廠牌1": b1, "✓1": bool(b1), "廠牌2": b2, "✓2": False, "其他廠牌": ORDER_NO_OTHER,
         })
+    if not base_rows:
+        st.info("此診所沒有啟用中的品項。")
+        return
+    base_df = pd.DataFrame(base_rows)
+    base_df["其他廠牌"] = base_df["其他廠牌"].astype(object)
 
-    order_df = pd.DataFrame(order_rows)
-    display = order_df if show_all else order_df[order_df["勾選"]]
+    # 編輯內容保存在 session_state；換診所或資料更新（指紋改變）時重建並清掉編輯
+    fp = hashlib.md5(repr([(r["_pid"], r["建議數量"], r["目前庫存"], r["廠牌1"], r["廠牌2"])
+                           for r in base_rows]).encode("utf-8")).hexdigest()
+    sig = (int(clinic_id), fp)
+    if st.session_state.get("order_sig") != sig:
+        st.session_state.order_sig = sig
+        st.session_state.order_df = base_df
+        st.session_state.order_ver = 0
+    full = st.session_state.order_df
 
-    if display.empty:
+    st.subheader("步驟一：編輯叫貨清單")
+    show_all = st.checkbox("顯示所有品項", value=False, key="order_show_all",
+                           help="預設只列出有建議叫貨數量的品項（廠牌1 為「用完不補」者除外）")
+    if show_all:
+        view = full
+    else:
+        view = full[(full["建議數量"] > 0) & (full["廠牌1"] != BRAND_NO_REORDER)]
+
+    if view.empty:
         st.success("所有品項庫存充足！")
         return
 
-    display = hide_zeros_in_cols(display, ["建議數量", "叫貨數量"])
-
-    edited = st.data_editor(
-        display[["勾選", "品項", "分類", "單位", "目前庫存", "建議數量", "叫貨數量", "廠牌"]],
-        use_container_width=True, hide_index=True,
+    st.caption("廠牌三選一：勾 ✓1 / ✓2，或在「其他廠牌」下拉選擇，其餘會自動取消；三個都沒選的品項以廠牌1 出單。"
+               "建議數量 = 四捨五入(平均耗用 × 備貨倍數 − 目前庫存)。")
+    view_df = view[ORDER_EDIT_COLS].copy()  # 數值 0 照常顯示（data_editor 會把缺值顯示成 "None"，不隱藏）
+    ed_key = f"order_editor_{st.session_state.order_ver}"
+    st.data_editor(
+        view_df,
+        key=ed_key, hide_index=True, use_container_width=True,
+        height=min(len(view) * 35 + 38, 600),
+        on_change=_apply_order_edits, args=(ed_key, list(view.index)),
         column_config={
             "勾選": st.column_config.CheckboxColumn("✅"),
             "品項": st.column_config.TextColumn(disabled=True),
-            "分類": st.column_config.TextColumn(disabled=True),
-            "單位": st.column_config.TextColumn(disabled=True),
+            "平均耗用": st.column_config.NumberColumn(disabled=True, format="%.1f"),
+            "最近耗用": st.column_config.NumberColumn(disabled=True, format="%.1f", help="最近一次盤點的耗用量"),
             "目前庫存": st.column_config.NumberColumn(disabled=True, format="%.1f"),
-            "建議數量": st.column_config.NumberColumn(disabled=True, format="%.1f"),
-            "叫貨數量": st.column_config.NumberColumn("數量 ✏️", min_value=0, format="%.1f"),
-            "廠牌": st.column_config.SelectboxColumn(options=brand_names),
+            "櫃位": st.column_config.TextColumn(disabled=True),
+            "建議數量": st.column_config.NumberColumn(disabled=True, format="%d"),
+            "數量": st.column_config.NumberColumn("數量 ✏️", min_value=0, step=1, format="%g"),
+            "廠牌1": st.column_config.TextColumn(disabled=True),
+            "✓1": st.column_config.CheckboxColumn("✓1", help="以廠牌1 出單"),
+            "廠牌2": st.column_config.TextColumn(disabled=True),
+            "✓2": st.column_config.CheckboxColumn("✓2", help="以廠牌2 出單"),
+            "其他廠牌": st.column_config.SelectboxColumn(options=[ORDER_NO_OTHER] + brand_options,
+                                                        help="以其他廠牌出單；選「（無）」取消"),
         },
-        height=min(len(display) * 35 + 38, 500), key="order_editor",
     )
+    full = st.session_state.order_df  # callback 已寫回
 
     st.divider()
     st.subheader("步驟二：依廠牌分組")
 
-    selected = edited[(edited["勾選"]) & (edited["叫貨數量"] > 0)]
-    if selected.empty:
+    sel = full[(full["勾選"]) & (full["數量"].fillna(0) > 0)].copy()
+    if sel.empty:
         st.info("請勾選要叫貨的品項")
         return
+    sel["廠牌"] = sel.apply(resolve_order_brand, axis=1)
+    n_skip = int((sel["廠牌"] == BRAND_NO_REORDER).sum())
+    sel = sel[sel["廠牌"] != BRAND_NO_REORDER]
+    if n_skip:
+        st.caption(f"{n_skip} 個品項的廠牌為「{BRAND_NO_REORDER}」，不列入叫貨單。")
 
-    brand_dfs = {}
-    for brand_name, group in selected.groupby("廠牌"):
-        if not brand_name:
-            brand_name = "未指定"
+    grouped = sorted(sel.groupby("廠牌", sort=False), key=lambda kv: brand_keys.get(kv[0], (1, 10 ** 9)))
+    flat_items = []
+    for brand_name, group in grouped:
         st.markdown(f"### 【{brand_name}】")
-        bdf = group[["品項", "叫貨數量", "單位"]].copy()
-        edited_brand = st.data_editor(bdf, use_container_width=True, hide_index=True,
-                                       column_config={"品項": st.column_config.TextColumn(disabled=True),
-                                                      "單位": st.column_config.TextColumn(disabled=True),
-                                                      "叫貨數量": st.column_config.NumberColumn(format="%.1f")},
-                                       key=f"brand_{brand_name}")
-        brand_dfs[brand_name] = edited_brand
+        bdf = (group[["品項", "數量", "_unit"]]
+               .rename(columns={"數量": "叫貨數量", "_unit": "單位"})
+               .reset_index(drop=True))
+        gfp = hashlib.md5(repr(list(zip(group["_pid"], group["數量"]))).encode("utf-8")).hexdigest()[:8]
+        edited_brand = st.data_editor(
+            bdf, use_container_width=True, hide_index=True,
+            column_config={"品項": st.column_config.TextColumn(disabled=True),
+                           "單位": st.column_config.TextColumn(disabled=True),
+                           "叫貨數量": st.column_config.NumberColumn(min_value=0, format="%g")},
+            key=f"brand_{brand_name}_{gfp}",
+        )
         st.caption(f"{len(edited_brand)} 品項")
+        for name, qty, cat_id in zip(edited_brand["品項"], edited_brand["叫貨數量"], group["_cat_id"]):
+            flat_items.append({"品項": name, "數量": qty, "category_id": cat_id, "廠牌": brand_name})
 
     st.divider()
     st.subheader("步驟三：匯出")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            for name, bdf in brand_dfs.items():
-                bdf.to_excel(writer, sheet_name=name[:31], index=False)
-        st.download_button("📥 合併版 .xlsx", data=buf.getvalue(),
-                           file_name=f"叫貨單_{selected_clinic}_{date.today()}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True, type="primary")
-    with col2:
-        all_items = pd.concat([bdf.assign(廠牌=n) for n, bdf in brand_dfs.items()], ignore_index=True)
-        st.download_button("📥 CSV", data=all_items.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"叫貨單_{selected_clinic}_{date.today()}.csv",
-                           mime="text/csv", use_container_width=True)
+    order_groups = group_order_items(flat_items, brand_keys)
+    n_items = sum(len(items) for _, items in order_groups)
+    st.download_button(
+        f"📥 下載叫貨單 (.xlsx)　{len(order_groups)} 個廠牌 / {n_items} 項",
+        data=_build_order_excel(selected_clinic, order_groups),
+        file_name=f"叫貨單_{selected_clinic}_{date.today()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True, type="primary", disabled=n_items == 0,
+    )
 
 
 # ══════════════════════════════════════════════
@@ -3334,51 +3640,80 @@ def page_settings():
         ])
         tab_users = None
 
-    # ── 參數（各分類獨立）──
+    # ── 參數：全域（平均耗用計算次數 / 異常閾值）＋ 各分類（備貨倍數 / 安全係數，可依櫃位 A–D）──
     with tab_params:
+        gp = load_global_params()
+        st.subheader("全域參數")
+        st.caption("所有分類共用。")
+        g1, g2 = st.columns(2)
+        with g1:
+            n_avg = st.number_input("平均耗用計算次數（近 N 次）", value=int(gp["avg_n"]),
+                                    min_value=1, max_value=24, step=1, key="gp_avg_n",
+                                    help="平均耗用 = 該品項最近 N 次盤點的耗用平均（首次盤點不計、負數當 0）")
+        with g2:
+            thr = st.number_input("異常耗用警示閾值（倍數）", value=float(gp["threshold"]),
+                                  min_value=0.0, step=0.1, format="%.1f", key="gp_threshold",
+                                  help="單次耗用超過 平均耗用 × 此倍數（且 > 1）或為負數時，庫存頁以紅色粗體標示")
+        if st.button("儲存全域參數", type="primary", key="gp_save"):
+            save_global_params(int(n_avg), float(thr))
+            invalidate_stock_cache()
+            st.success("已更新全域參數")
+
+        st.divider()
         st.subheader("各分類參數設定")
-        st.caption("每個分類可獨立設定；計算「平均耗用」「建議叫貨」與「異常耗用提醒」時，會套用該品項所屬分類的數值。")
+        st.caption("目標庫存備貨倍數與建議叫貨安全係數可依櫃位 A/B/C/D 分別設定："
+                   "櫃位取第一個字母（A、A2、A70 都算 A），無櫃位或非 A–D 開頭比照 B。"
+                   "建議叫貨 = 四捨五入(平均耗用 × 備貨倍數 − 目前庫存)，庫存 < 平均耗用 × 安全係數 才啟動，算出 ≤ 0 不建議。")
         param_cats = load_categories()
-        avg_col_missing = all(c.get("avg_window") is None for c in param_cats)
-        if avg_col_missing:
-            st.warning("尚未執行 migration_v7_avg_window.sql：「平均耗用計算次數」暫以預設 6 次計算，且無法儲存。"
-                       "請在 Supabase SQL Editor 執行該腳本後再設定。")
-        with st.form("cat_params_form"):
-            new_params = {}
-            for c in param_cats:
-                st.markdown(f"**{c['name']}**")
-                pc1, pc2, pc3, pc4 = st.columns(4)
+        v8_missing = categories_v8_missing(param_cats)
+        if v8_missing:
+            st.warning("尚未執行 migration_v8_cabinet_params.sql：目前只能設定不分櫃位的數值。"
+                       "請在 Supabase SQL Editor 執行該腳本後，再依櫃位分別設定。")
+
+        def _num(v, d):
+            return float(v) if v not in (None, "") else float(d)
+
+        new_params = {}
+        for c in param_cats:
+            cid = c["id"]
+            st.markdown(f"**{c['name']}**")
+            m_def = _num(c.get("stock_target_multiplier"), DEFAULT_CAT_PARAMS["multiplier"])
+            s_def = _num(c.get("safety_factor"), DEFAULT_CAT_PARAMS["safety"])
+            vals = {}
+            by_cab = False
+            if not v8_missing:
+                by_cab = st.checkbox("依櫃位 A/B/C/D 分別設定", value=bool(c.get("by_cabinet")),
+                                     key=f"cp_bycab_{cid}")
+                vals["by_cabinet"] = bool(by_cab)
+            if by_cab:
+                mcols = st.columns(4)
+                for g, col in zip(CABINET_GROUPS, mcols):
+                    with col:
+                        vals[f"multiplier_{g.lower()}"] = st.number_input(
+                            f"目標庫存備貨倍數({g})", value=_num(c.get(f"multiplier_{g.lower()}"), m_def),
+                            min_value=0.0, step=0.1, format="%.1f", key=f"cp_m{g}_{cid}")
+                scols = st.columns(4)
+                for g, col in zip(CABINET_GROUPS, scols):
+                    with col:
+                        vals[f"safety_{g.lower()}"] = st.number_input(
+                            f"建議叫貨安全係數({g})", value=_num(c.get(f"safety_{g.lower()}"), s_def),
+                            min_value=0.0, step=0.1, format="%.1f", key=f"cp_s{g}_{cid}")
+            else:
+                pc1, pc2 = st.columns(2)
                 with pc1:
-                    m = st.number_input("目標庫存備貨倍數",
-                                        value=float(c.get("stock_target_multiplier") or DEFAULT_CAT_PARAMS["multiplier"]),
-                                        min_value=0.0, step=0.1, format="%.1f", key=f"cp_m_{c['id']}")
+                    vals["stock_target_multiplier"] = st.number_input(
+                        "目標庫存備貨倍數", value=m_def, min_value=0.0, step=0.1, format="%.1f", key=f"cp_m_{cid}")
                 with pc2:
-                    t = st.number_input("異常耗用警示閾值（倍數）",
-                                        value=float(c.get("anomaly_threshold") or DEFAULT_CAT_PARAMS["threshold"]),
-                                        min_value=0.0, step=0.1, format="%.1f", key=f"cp_t_{c['id']}")
-                with pc3:
-                    sfa = st.number_input("建議叫貨安全係數",
-                                          value=float(c.get("safety_factor") or DEFAULT_CAT_PARAMS["safety"]),
-                                          min_value=0.0, step=0.1, format="%.1f", key=f"cp_s_{c['id']}")
-                with pc4:
-                    n_avg = st.number_input("平均耗用計算次數（近 N 次）",
-                                            value=int(c.get("avg_window") or DEFAULT_AVG_WINDOW),
-                                            min_value=1, max_value=24, step=1, key=f"cp_n_{c['id']}",
-                                            disabled=avg_col_missing,
-                                            help="平均耗用 = 該品項最近 N 次盤點的耗用平均（首次盤點不計、負數當 0）")
-                new_params[c["id"]] = {
-                    "stock_target_multiplier": m,
-                    "anomaly_threshold": t,
-                    "safety_factor": sfa,
-                }
-                if not avg_col_missing:
-                    new_params[c["id"]]["avg_window"] = int(n_avg)
-            if st.form_submit_button("儲存全部分類", type="primary"):
-                for cid, vals in new_params.items():
-                    sb.table("categories").update(vals).eq("id", cid).execute()
-                load_categories.clear()
-                invalidate_stock_cache()
-                st.success("已更新所有分類參數")
+                    vals["safety_factor"] = st.number_input(
+                        "建議叫貨安全係數", value=s_def, min_value=0.0, step=0.1, format="%.1f", key=f"cp_s_{cid}")
+            new_params[cid] = vals
+
+        if st.button("儲存全部分類", type="primary", key="cp_save"):
+            for cid, vals in new_params.items():
+                sb.table("categories").update(vals).eq("id", cid).execute()
+            load_categories.clear()
+            invalidate_stock_cache()
+            st.success("已更新所有分類參數")
 
     # ── 分類 ──
     with tab_cats:
