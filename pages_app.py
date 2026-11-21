@@ -2961,6 +2961,59 @@ __VERIFY_RESULT__
 #  4. 品項管理（per-clinic 廠牌/啟用）
 # ══════════════════════════════════════════════
 
+def render_delete_product(products: list, sb) -> None:
+    """🗑️ 永久刪除品項（僅院長）。兩診所一併移除，連同進價、盤點明細、進退貨紀錄；
+    有歷史紀錄者須輸入完整品名確認。一般情況請用「啟用」欄停用（軟刪除）。"""
+    with st.expander("🗑️ 刪除品項（僅院長，不可復原）"):
+        st.caption("一般情況請取消勾選「啟用」即可（停用＝軟刪除）。這裡會把品項從兩間診所移除，"
+                   "連同進價、盤點明細與進退貨紀錄一併刪除，無法復原。")
+        labels = {f"{p['name']}（{p['categories']['name']}）": p for p in products}
+        pick = st.selectbox("選擇要刪除的品項", list(labels), index=None, placeholder="輸入中文或選取…", key="del_prod_pick")
+        if not pick or pick not in labels:
+            return
+        p = labels[pick]
+        pid = p["id"]
+
+        def _count(tbl):
+            try:
+                return len(sb.table(tbl).select("id").eq("product_id", pid).execute().data)
+            except Exception:
+                return 0   # product_prices 表可能尚未建立
+
+        n_logs, n_tx, n_price = _count("inventory_logs"), _count("transactions"), _count("product_prices")
+        cs = sb.table("clinic_stock").select("current_stock, clinics(name)").eq("product_id", pid).execute().data
+        stock_txt = "、".join(f"{c['clinics']['name']} {float(c['current_stock'] or 0):g}" for c in cs) or "無"
+        st.markdown(f"**{p['name']}**｜目前庫存：{stock_txt}｜盤點明細 {n_logs} 筆｜進退貨 {n_tx} 筆｜進價 {n_price} 格")
+        if n_logs or n_tx:
+            st.warning("此品項有盤點或進退貨紀錄，刪除後歷史資料一併消失，庫存頁與數據分析的過往統計會少掉它。"
+                       "若只是不再進貨，建議改用停用。")
+            typed = st.text_input("請輸入完整品項名稱以確認刪除", key="del_prod_typed")
+            confirmed = typed.strip() == p["name"]
+        else:
+            confirmed = st.checkbox("我確認要永久刪除此品項", key="del_prod_ok")
+        if st.button("🗑️ 永久刪除", type="primary", disabled=not confirmed, key="del_prod_go"):
+            try:
+                for tbl in ("inventory_logs", "transactions", "product_prices", "clinic_stock"):
+                    try:
+                        sb.table(tbl).delete().eq("product_id", pid).execute()
+                    except Exception:
+                        if tbl != "product_prices":
+                            raise
+                sb.table("products").delete().eq("id", pid).execute()
+            except Exception as e:
+                st.error(f"刪除失敗：{e}")
+                return
+            load_products.clear()
+            invalidate_stock_cache()
+            try:
+                from pages_price import invalidate_price_cache
+                invalidate_price_cache()
+            except Exception:
+                pass
+            st.success(f"已刪除：{p['name']}")
+            st.rerun()
+
+
 def page_items():
     st.header("📋 品項管理")
 
@@ -3134,6 +3187,8 @@ def page_items():
                         st.info("沒有變更")
 
                 st.caption(f"共 {len(df)} 個品項（停用品項=軟刪除，取消勾選「啟用」即可）— {selected_clinic}")
+                if st.session_state.user["role"] == "admin":
+                    render_delete_product(products, sb)
             else:
                 st.dataframe(style_banded(df), use_container_width=True, hide_index=True, height=min(len(df) * 35 + 38, 600))
                 st.caption(f"共 {len(df)} 個品項 — {selected_clinic}")
