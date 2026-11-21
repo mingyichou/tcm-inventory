@@ -219,6 +219,11 @@ def load_units():
     return with_retry(lambda: get_supabase_client().table("units").select("id, name").order("id").execute().data)
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def load_clinics() -> list:
+    return with_retry(lambda: get_supabase_client().table("clinics").select("id, name").order("id").execute().data)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_clinic_id(clinic_name: str) -> int | None:
     resp = with_retry(lambda: get_supabase_client().table("clinics").select("id").eq("name", clinic_name).execute())
     return resp.data[0]["id"] if resp.data else None
@@ -370,6 +375,12 @@ DEFAULT_CAT_PARAMS = {"multiplier": 2.0, "safety": 1.2}
 CABINET_GROUPS = ("A", "B", "C", "D")
 DEFAULT_CABINET_GROUP = "B"
 
+# 診所間廠牌同步：開啟時，在「品項管理」修改任一診所的第一/第二廠牌，會同步套用到其他診所的同一品項（雙向）。
+# 品項名稱/分類/單位/規格存在共用的 products 表，兩診所本來就一致；櫃位與啟用狀態永遠各診所獨立、不同步。
+# 開關存於 system_settings（key=SYNC_BRANDS_KEY，"1"/"0"），可在「系統設定 → 參數」切換；缺值套預設。
+SYNC_BRANDS_KEY = "sync_brands_across_clinics"
+DEFAULT_SYNC_BRANDS = True
+
 # 庫存頁顯示的盤點次數（盤/進/耗 欄）
 MAX_DISPLAY_DATES = 6
 
@@ -382,8 +393,8 @@ def cabinet_group(cabinet) -> str:
 
 @st.cache_data(ttl=30)
 def load_global_params() -> dict:
-    """全域參數：avg_n=平均耗用計算次數（近 N 次盤點）、threshold=異常耗用警示閾值（倍數）。
-    存於 system_settings（key/value）；缺值套預設。"""
+    """全域參數：avg_n=平均耗用計算次數（近 N 次盤點）、threshold=異常耗用警示閾值（倍數）、
+    sync_brands=診所間廠牌同步開關。存於 system_settings（key/value）；缺值套預設。"""
     rows = with_retry(lambda: get_supabase_client().table("system_settings").select("key, value").execute().data)
     kv = {r["key"]: r["value"] for r in rows}
 
@@ -396,6 +407,8 @@ def load_global_params() -> dict:
     return {
         "avg_n": max(1, _get("avg_window", DEFAULT_AVG_WINDOW, lambda v: int(float(v)))),
         "threshold": _get("anomaly_threshold", DEFAULT_THRESHOLD, float),
+        "sync_brands": _get(SYNC_BRANDS_KEY, DEFAULT_SYNC_BRANDS,
+                            lambda v: str(v).strip().lower() in ("1", "true", "on", "yes")),
     }
 
 
@@ -406,6 +419,53 @@ def save_global_params(avg_n: int, threshold: float) -> None:
         {"key": "anomaly_threshold", "value": str(float(threshold)), "description": "異常耗用警示閾值（倍數）"},
     ]).execute()
     load_global_params.clear()
+
+
+def save_sync_brands(enabled: bool) -> None:
+    """切換診所間廠牌同步開關（存 system_settings）。"""
+    sb = get_supabase_client()
+    sb.table("system_settings").upsert({
+        "key": SYNC_BRANDS_KEY, "value": "1" if enabled else "0",
+        "description": "診所間同步第一/第二廠牌（1=開啟，0=各診所獨立）",
+    }).execute()
+    load_global_params.clear()
+
+
+def diff_brands_between_clinics(src_clinic_id: int, dst_clinic_id: int) -> list:
+    """列出 dst 診所與 src 診所第一/第二廠牌不同的品項（以 src 為準）。
+    回傳 [{product_id, name, dst_row_id, src:(b1,b2), dst:(b1,b2)}]；dst 缺少的品項不處理。"""
+    sb = get_supabase_client()
+    cols = "id, product_id, brand1_id, brand2_id"
+    src = {r["product_id"]: r for r in fetch_all(
+        sb.table("clinic_stock").select(cols).eq("clinic_id", src_clinic_id).order("id"))}
+    dst = {r["product_id"]: r for r in fetch_all(
+        sb.table("clinic_stock").select(cols).eq("clinic_id", dst_clinic_id).order("id"))}
+    names = {p["id"]: p["name"] for p in load_products()}
+    out = []
+    for pid, s in src.items():
+        d = dst.get(pid)
+        if d is None:
+            continue
+        if (s["brand1_id"], s["brand2_id"]) != (d["brand1_id"], d["brand2_id"]):
+            out.append({"product_id": pid, "name": names.get(pid, f"#{pid}"), "dst_row_id": d["id"],
+                        "src": (s["brand1_id"], s["brand2_id"]), "dst": (d["brand1_id"], d["brand2_id"])})
+    return out
+
+
+def apply_brand_sync(diffs: list, dst_clinic_id: int) -> tuple:
+    """把 diff_brands_between_clinics 的結果寫入 dst 診所。回傳 (成功筆數, 失敗訊息list)。"""
+    sb = get_supabase_client()
+    ok, errors = 0, []
+    for d in diffs:
+        try:
+            sb.table("clinic_stock").update({"brand1_id": d["src"][0], "brand2_id": d["src"][1]}) \
+              .eq("id", d["dst_row_id"]).eq("clinic_id", dst_clinic_id).execute()
+            ok += 1
+        except Exception as e:
+            errors.append(f"{d['name']}: {e}")
+    if ok:
+        invalidate_stock_cache()
+    return ok, errors
 
 
 def build_category_params(categories: list) -> dict:
@@ -2910,6 +2970,10 @@ def page_items():
 
     sb = get_supabase_client()
 
+    # 診所間廠牌同步開關（系統設定可切換）；other_names = 其他診所名稱（提示文字用）
+    sync_brands = bool(load_global_params()["sync_brands"])
+    other_names = [c["name"] for c in load_clinics() if c["id"] != clinic_id]
+
     # 載入 per-clinic 資料
     cs_data = sb.table("clinic_stock").select(
         "product_id, brand1_id, brand2_id, is_active, cabinet"
@@ -2923,6 +2987,9 @@ def page_items():
 
     with tab_list:
         st.caption(f"📍 顯示 **{selected_clinic}** 的廠牌與啟用狀態")
+        if sync_brands and other_names:
+            st.info(f"🔗 診所間廠牌同步已開啟：在此修改「第一/第二廠牌」會同步套用到 {'、'.join(other_names)} 的同一品項"
+                    "（櫃位、啟用狀態仍各診所獨立）。可在「系統設定 → 參數」關閉。")
 
         col1, col2, col3 = st.columns([2, 2, 3])
         with col1:
@@ -2985,6 +3052,7 @@ def page_items():
 
                 if st.button("💾 儲存修改", type="primary"):
                     updated = 0
+                    synced = 0
                     for idx in range(len(edited_df)):
                         old, new = df.iloc[idx], edited_df.iloc[idx]
                         pid = product_ids[idx]
@@ -3028,9 +3096,18 @@ def page_items():
                             sb.table("clinic_stock").update(cs_changes).eq(
                                 "product_id", pid).eq("clinic_id", clinic_id).execute()
                             updated += 1
+                            # 診所間廠牌同步：只同步第一/第二廠牌到其他診所（櫃位/啟用狀態不同步）
+                            brand_changes = {k: v for k, v in cs_changes.items() if k in ("brand1_id", "brand2_id")}
+                            if sync_brands and brand_changes and other_names:
+                                sb.table("clinic_stock").update(brand_changes).eq(
+                                    "product_id", pid).neq("clinic_id", clinic_id).execute()
+                                synced += 1
 
                     if updated > 0:
-                        st.success(f"已更新 {updated} 個品項")
+                        msg = f"已更新 {updated} 個品項"
+                        if synced:
+                            msg += f"（其中 {synced} 個品項的廠牌已同步到 {'、'.join(other_names)}）"
+                        st.success(msg)
                         load_products.clear()
                     else:
                         st.info("沒有變更")
@@ -3658,6 +3735,59 @@ def page_settings():
             save_global_params(int(n_avg), float(thr))
             invalidate_stock_cache()
             st.success("已更新全域參數")
+
+        st.divider()
+        st.subheader("診所間廠牌同步")
+        st.caption("開啟時，在「品項管理」修改任一診所的第一/第二廠牌，會同步套用到其他診所的同一品項（雙向）。"
+                   "品項名稱、分類、單位、規格本來就是兩診所共用，不需同步；櫃位與啟用狀態永遠各診所獨立。"
+                   "日後兩診所廠牌要分開管理時關閉即可，已同步的資料不會變動。")
+        sync_now = st.toggle("開啟診所間廠牌自動同步", value=bool(gp["sync_brands"]), key="gp_sync_brands")
+        if sync_now != bool(gp["sync_brands"]):
+            save_sync_brands(bool(sync_now))
+            st.success("已開啟廠牌自動同步" if sync_now else "已關閉廠牌自動同步，兩診所廠牌改為各自獨立")
+
+        with st.expander("🔄 立即整批同步：以某一診所為準，把第一/第二廠牌複製到其他診所"):
+            clinics_all = load_clinics()
+            cnames = [c["name"] for c in clinics_all]
+            src_name = st.selectbox("以哪間診所為準（來源）", cnames, key="sync_src")
+            src_cid = next(c["id"] for c in clinics_all if c["name"] == src_name)
+            dst_list = [c for c in clinics_all if c["id"] != src_cid]
+            bmap = {b["id"]: b["name"] for b in load_brands()}
+
+            def _bn(bid):
+                return bmap.get(bid, "-") if bid is not None else "-"
+
+            if st.button("🔍 檢查差異", key="sync_check"):
+                st.session_state["sync_diffs"] = {d["id"]: diff_brands_between_clinics(src_cid, d["id"]) for d in dst_list}
+                st.session_state["sync_diffs_src"] = src_cid
+
+            diffs_by_dst = st.session_state.get("sync_diffs")
+            if diffs_by_dst is not None and st.session_state.get("sync_diffs_src") == src_cid:
+                total = sum(len(v) for v in diffs_by_dst.values())
+                if total == 0:
+                    st.success(f"其他診所的第一/第二廠牌已與 {src_name} 一致，不需同步。")
+                else:
+                    for d in dst_list:
+                        rows = diffs_by_dst.get(d["id"], [])
+                        if not rows:
+                            continue
+                        st.markdown(f"**{d['name']}** 有 {len(rows)} 個品項與 {src_name} 不同：")
+                        st.dataframe(pd.DataFrame([{
+                            "品項": r["name"],
+                            f"{d['name']} 目前": f"{_bn(r['dst'][0])} / {_bn(r['dst'][1])}",
+                            f"改為（{src_name}）": f"{_bn(r['src'][0])} / {_bn(r['src'][1])}",
+                        } for r in rows]), hide_index=True, use_container_width=True,
+                            height=min(len(rows) * 35 + 38, 400))
+                    if st.button(f"✅ 確認同步（{total} 筆）", type="primary", key="sync_apply"):
+                        ok_total, errs = 0, []
+                        for d in dst_list:
+                            ok, e = apply_brand_sync(diffs_by_dst.get(d["id"], []), d["id"])
+                            ok_total += ok
+                            errs += e
+                        st.session_state.pop("sync_diffs", None)
+                        if errs:
+                            st.error("部分失敗：" + "；".join(errs[:5]))
+                        st.success(f"已同步 {ok_total} 筆到 {'、'.join(d['name'] for d in dst_list)}")
 
         st.divider()
         st.subheader("各分類參數設定")
