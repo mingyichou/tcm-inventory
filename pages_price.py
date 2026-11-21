@@ -54,6 +54,63 @@ def product_section(cat_name) -> str:
     return "自費" if ("自費" in name or "高貴" in name) else "健保"
 
 
+def is_auto_price_category(cat_name) -> bool:
+    """自費科中（「特.」品項）：進價自動帶入同名健保品項，不可手填；高貴藥材則可手填。"""
+    name = cat_name or ""
+    return "自費" in name and "高貴" not in name
+
+
+_VARIANTS = str.maketrans({"蔘": "參", "术": "朮", "姜": "薑", "芪": "耆", "荆": "荊"})
+
+
+def _norm_name(name) -> str:
+    """品名正規化（找同名健保品項用）：去括號註記、去 特./特級、去 -規格 後綴、異體字統一。"""
+    s = str(name).strip().replace("（", "(").replace("）", ")")
+    s = re.sub(r"\(.*?\)", "", s)
+    s = re.sub(r"[-－—]+.*$", "", s)
+    s = re.sub(r"^特[.．級]", "", s)
+    for a, b in (("瓜蔞", "栝樓"), ("栝婁", "栝樓"), ("栝簍", "栝樓"), ("栝蔞", "栝樓"), ("龜粄", "龜板")):
+        s = s.replace(a, b)
+    return re.sub(r"\s+", "", s.translate(_VARIANTS))
+
+
+def _cat_of(p, cat_names: dict) -> str:
+    return cat_names.get(p["category_id"]) or (p.get("categories") or {}).get("name", "")
+
+
+def build_linked_sources(products: list, cat_names: dict) -> dict:
+    """{特.品項 id: 同名健保品項 id}（同單複方、正規化品名相同；多個候選時取去掉「特.」後完全同名者，否則取最短名）。
+    沒有同名健保品項時退而對應同名「高貴藥材」品項（如 特.吳茱萸湯 → 特級吳茱萸湯）。"""
+    by_key, by_key_precious = {}, {}
+    for p in products:
+        cname = _cat_of(p, cat_names)
+        key = (product_kind(cname), _norm_name(p["name"]))
+        if product_section(cname) == "健保":
+            by_key.setdefault(key, []).append(p)
+        elif "高貴" in cname:
+            by_key_precious.setdefault(key, []).append(p)
+    out = {}
+    for p in products:
+        cname = _cat_of(p, cat_names)
+        if not is_auto_price_category(cname):
+            continue
+        key = (product_kind(cname), _norm_name(p["name"]))
+        cands = by_key.get(key) or by_key_precious.get(key) or []
+        if not cands:
+            continue
+        if len(cands) > 1:
+            bare = re.sub(r"^特[.．]", "", p["name"]).strip()
+            exact = [c for c in cands if c["name"].strip() == bare]
+            cands = exact or sorted(cands, key=lambda c: len(c["name"]))
+        out[p["id"]] = cands[0]["id"]
+    return out
+
+
+def _price_of(prices: dict, row: dict, brand_id: int):
+    """該列某廠牌的進價記錄；特. 品項改讀同名健保品項（row["src"]）。"""
+    return prices.get((row.get("src") or row["pid"], brand_id))
+
+
 def calc_cost(price, multiplier):
     """成本 = 進價 × 倍數，無條件進位取整（與原 Excel ROUNDUP 一致）。
     multiplier 建議傳 Fraction（由算式精確算出），避免 5/6*0.65 這類循環小數因浮點誤差多進 1。"""
@@ -111,11 +168,11 @@ def fmt_price(price, note=None) -> str:
     return note or ""
 
 
-def _row_remarks(pid, brands_k, prices) -> str:
+def _row_remarks(row, brands_k, prices) -> str:
     """同時有進價與備註的格（如 莊松榮 240 + 無）→ 匯出時集中在「備註」欄：莊松榮:無"""
     out = []
     for b in brands_k:
-        pr = prices.get((pid, b["brand_id"]))
+        pr = _price_of(prices, row, b["brand_id"])
         if pr and pr["price"] is not None and pr.get("note"):
             out.append(f"{b['name']}:{pr['note']}")
     return "、".join(out)
@@ -250,11 +307,13 @@ def invalidate_price_cache():
 #  表格資料
 # ══════════════════════════════════════════════
 
-def build_rows(kind: str, cs_map: dict, products: list, cat_names: dict) -> list:
-    """kind（單方/複方）的啟用品項列，依 區段(健保→自費) → 首字注音 → 全字注音 排序。"""
+def build_rows(kind: str, cs_map: dict, products: list, cat_names: dict, linked: dict | None = None) -> list:
+    """kind（單方/複方）的啟用品項列，依 區段(健保→自費) → 首字注音 → 全字注音 排序。
+    linked：build_linked_sources() 結果；特. 品項列帶 auto=True、src=同名健保品項 id（可能 None＝找不到）。"""
+    linked = linked or {}
     rows = []
     for p in products:
-        cname = cat_names.get(p["category_id"]) or (p.get("categories") or {}).get("name", "")
+        cname = _cat_of(p, cat_names)
         if product_kind(cname) != kind:
             continue
         cs = cs_map.get(p["id"])
@@ -265,6 +324,7 @@ def build_rows(kind: str, cs_map: dict, products: list, cat_names: dict) -> list
             "initial": get_bopomofo_initial(p["name"]), "sort": get_bopomofo_sort_key(_sort_name(p["name"])),
             "cabinet": cs.get("cabinet") or "",
             "b1": cs.get("brand1_id"), "b2": cs.get("brand2_id"), "b3": cs.get("brand3_id"),
+            "auto": is_auto_price_category(cname), "src": linked.get(p["id"]),
         })
     rows.sort(key=lambda r: (SECTIONS.index(r["section"]), r["initial"], r["sort"]))
     return rows
@@ -285,7 +345,7 @@ def _price_frame(sec_rows, brands_k, prices, high):
     for r, lab in zip(sec_rows, _initial_labels(sec_rows)):
         rec, crec = {"注音": lab, "品項": r["name"]}, {"注音": "", "品項": ""}
         for b in brands_k:
-            pr = prices.get((r["pid"], b["brand_id"]))
+            pr = _price_of(prices, r, b["brand_id"])
             rec[b["name"]] = fmt_price(pr["price"], pr["note"]) if pr else ""
             cost = calc_cost(pr["price"], b["multiplier"]) if pr else None
             crec[b["name"]] = ORANGE_CSS if (cost is not None and cost >= high) else ""
@@ -303,7 +363,7 @@ def _cost_frame(sec_rows, brands_k, prices, high, brand_map):
         if g in NAME_COLOR_BY_CABINET:
             crec["品項"] = f"color:#{NAME_COLOR_BY_CABINET[g]}"
         for b in brands_k:
-            pr = prices.get((r["pid"], b["brand_id"]))
+            pr = _price_of(prices, r, b["brand_id"])
             cost = calc_cost(pr["price"], b["multiplier"]) if pr else None
             if cost is not None:
                 rec[b["name"]] = str(cost)
@@ -427,7 +487,7 @@ def build_price_workbook(tables: dict, prices: dict, high: dict, as_of: date) ->
         rows, brands_k = tables[kind]
         ws = wb.create_sheet(f"科學中藥-{kind}")
         ncol = 2 + len(brands_k)
-        has_remark = any(_row_remarks(x["pid"], brands_k, prices) for x in rows)
+        has_remark = any(_row_remarks(x, brands_k, prices) for x in rows)
         widths = {"A": 4.5, "B": 16 if kind == "複方" else 11.4,
                   **{ws.cell(3, 3 + i).column_letter: 9 for i in range(len(brands_k))}}
         if has_remark:
@@ -452,7 +512,7 @@ def build_price_workbook(tables: dict, prices: dict, high: dict, as_of: date) ->
                 _write_cell(ws, r, 1, lab or None)
                 _write_cell(ws, r, 2, x["name"])
                 for i, b in enumerate(brands_k):
-                    pr = prices.get((x["pid"], b["brand_id"]))
+                    pr = _price_of(prices, x, b["brand_id"])
                     cell = _write_cell(ws, r, 3 + i)
                     if not pr:
                         continue
@@ -465,7 +525,7 @@ def build_price_workbook(tables: dict, prices: dict, high: dict, as_of: date) ->
                     elif pr["note"]:
                         cell.value = pr["note"]
                 if has_remark:
-                    _write_cell(ws, r, ncol + 1, _row_remarks(x["pid"], brands_k, prices) or None)
+                    _write_cell(ws, r, ncol + 1, _row_remarks(x, brands_k, prices) or None)
                 r += 1
     buf = io.BytesIO()
     wb.save(buf)
@@ -481,7 +541,7 @@ def build_cost_workbook(tables: dict, prices: dict, high: dict, brand_map: dict,
         ws = wb.create_sheet(f"科學中藥-{kind}")
         nb = len(brands_k)
         extra = ("廠1", "廠2", "廠3", "櫃")
-        if any(_row_remarks(x["pid"], brands_k, prices) for x in rows):
+        if any(_row_remarks(x, brands_k, prices) for x in rows):
             extra = extra + ("備註",)
         widths = {"A": 3.8, "B": 17.4 if kind == "複方" else 12.8}
         for i in range(nb):
@@ -508,7 +568,7 @@ def build_cost_workbook(tables: dict, prices: dict, high: dict, brand_map: dict,
                 name_font = _font_color(NAME_COLOR_BY_CABINET[g]) if g in NAME_COLOR_BY_CABINET else _FONT
                 _write_cell(ws, r, 2, x["name"], font=name_font)
                 for i, b in enumerate(brands_k):
-                    pr = prices.get((x["pid"], b["brand_id"]))
+                    pr = _price_of(prices, x, b["brand_id"])
                     cell = _write_cell(ws, r, 3 + i)
                     if not pr:
                         continue
@@ -523,7 +583,7 @@ def build_cost_workbook(tables: dict, prices: dict, high: dict, brand_map: dict,
                     _write_cell(ws, r, 3 + nb + j, _abbr(brand_map.get(x[key])) or None)
                 _write_cell(ws, r, 3 + nb + 3, x["cabinet"] or None)
                 if len(extra) == 5:
-                    _write_cell(ws, r, 3 + nb + 4, _row_remarks(x["pid"], brands_k, prices) or None)
+                    _write_cell(ws, r, 3 + nb + 4, _row_remarks(x, brands_k, prices) or None)
                 r += 1
     buf = io.BytesIO()
     wb.save(buf)
@@ -537,12 +597,20 @@ def build_cost_workbook(tables: dict, prices: dict, high: dict, brand_map: dict,
 def _render_price_table(kind, rows, brands_k, prices, high):
     edit = st.toggle("✏️ 編輯進價", key=f"price_edit_{kind}")
     st.caption(f"成本 = 進價 × 廠牌倍數；成本 ≥ {high:g} 的進價以橘色粗體標示。"
+               "「特.」自費科中品項的進價自動帶入同名健保品項，不可手填。"
                + ("直接在表格填寫後按「儲存進價」；清空＝刪除，可填「時價」等文字，或「240(無)」＝進價 240 加備註。" if edit
                   else "開啟「編輯進價」即可填寫。"))
     for section, sec in _iter_sections(rows):
         st.markdown(f"**{SECTION_LABEL[section]}**（{len(sec)} 項）")
-        df, css = _price_frame(sec, brands_k, prices, high)
-        if edit:
+        if not edit:
+            df, css = _price_frame(sec, brands_k, prices, high)
+            st.dataframe(df.style.apply(lambda _: css, axis=None), hide_index=True,
+                         use_container_width=True, height=_table_height(len(df)))
+            continue
+        manual = [r for r in sec if not r["auto"]]
+        auto = [r for r in sec if r["auto"]]
+        if manual:
+            df, _ = _price_frame(manual, brands_k, prices, high)
             cfg = {"注音": st.column_config.TextColumn(disabled=True, width="small"),
                    "品項": st.column_config.TextColumn(disabled=True)}
             for b in brands_k:
@@ -550,15 +618,19 @@ def _render_price_table(kind, rows, brands_k, prices, high):
             ed = st.data_editor(df, hide_index=True, use_container_width=True, height=_table_height(len(df)),
                                 column_config=cfg, key=f"price_ed_{kind}_{section}")
             if st.button("💾 儲存進價", type="primary", key=f"price_save_{kind}_{section}"):
-                n_up, n_del = save_price_edits(sec, brands_k, df, ed, prices)
+                n_up, n_del = save_price_edits(manual, brands_k, df, ed, prices)
                 if n_up or n_del:
                     st.success(f"已儲存：更新 {n_up} 格、清除 {n_del} 格")
                     st.rerun()
                 else:
                     st.info("沒有變更")
-        else:
-            st.dataframe(df.style.apply(lambda _: css, axis=None), hide_index=True,
-                         use_container_width=True, height=_table_height(len(df)))
+        if auto:
+            missing = [r["name"] for r in auto if not r.get("src")]
+            st.caption(f"🔒 以下 {len(auto)} 個「特.」品項進價自動帶入同名健保品項，不可手填"
+                       + (f"；找不到同名健保品項：{'、'.join(missing)}" if missing else "") + "。")
+            adf, acss = _price_frame(auto, brands_k, prices, high)
+            st.dataframe(adf.style.apply(lambda _: acss, axis=None), hide_index=True,
+                         use_container_width=True, height=_table_height(len(adf)))
 
 
 def _render_cost_table(kind, rows, brands_k, prices, high, brand_map, brands, clinic_id):
@@ -630,7 +702,8 @@ def page_price():
     prices = load_product_prices()
     brands = load_brands()
     brand_map = {b["id"]: b["name"] for b in brands}
-    tables = {k: (build_rows(k, cs_map, products, cat_names), [b for b in ptb if b["kind"] == k]) for k in KINDS}
+    linked = build_linked_sources(products, cat_names)
+    tables = {k: (build_rows(k, cs_map, products, cat_names, linked), [b for b in ptb if b["kind"] == k]) for k in KINDS}
 
     with c2:
         if is_cost:
