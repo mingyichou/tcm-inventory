@@ -224,6 +224,16 @@ def load_clinics() -> list:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def clinic_stock_has_brand3() -> bool:
+    """True = 已執行 migration_v10（clinic_stock 有 brand3_id 第三廠牌欄）。"""
+    try:
+        get_supabase_client().table("clinic_stock").select("brand3_id").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_clinic_id(clinic_name: str) -> int | None:
     resp = with_retry(lambda: get_supabase_client().table("clinics").select("id").eq("name", clinic_name).execute())
     return resp.data[0]["id"] if resp.data else None
@@ -380,6 +390,8 @@ DEFAULT_CABINET_GROUP = "B"
 # 開關存於 system_settings（key=SYNC_BRANDS_KEY，"1"/"0"），可在「系統設定 → 參數」切換；缺值套預設。
 SYNC_BRANDS_KEY = "sync_brands_across_clinics"
 DEFAULT_SYNC_BRANDS = True
+# clinic_stock 的廠牌欄位（brand3_id 由 migration_v10 新增，沒有時只用前兩個）
+BRAND_ID_KEYS = ("brand1_id", "brand2_id", "brand3_id")
 
 # 庫存頁顯示的盤點次數（盤/進/耗 欄）
 MAX_DISPLAY_DATES = 6
@@ -435,7 +447,8 @@ def diff_brands_between_clinics(src_clinic_id: int, dst_clinic_id: int) -> list:
     """列出 dst 診所與 src 診所第一/第二廠牌不同的品項（以 src 為準）。
     回傳 [{product_id, name, dst_row_id, src:(b1,b2), dst:(b1,b2)}]；dst 缺少的品項不處理。"""
     sb = get_supabase_client()
-    cols = "id, product_id, brand1_id, brand2_id"
+    keys = BRAND_ID_KEYS if clinic_stock_has_brand3() else BRAND_ID_KEYS[:2]
+    cols = "id, product_id, " + ", ".join(keys)
     src = {r["product_id"]: r for r in fetch_all(
         sb.table("clinic_stock").select(cols).eq("clinic_id", src_clinic_id).order("id"))}
     dst = {r["product_id"]: r for r in fetch_all(
@@ -446,9 +459,10 @@ def diff_brands_between_clinics(src_clinic_id: int, dst_clinic_id: int) -> list:
         d = dst.get(pid)
         if d is None:
             continue
-        if (s["brand1_id"], s["brand2_id"]) != (d["brand1_id"], d["brand2_id"]):
+        s_b, d_b = tuple(s.get(k) for k in keys), tuple(d.get(k) for k in keys)
+        if s_b != d_b:
             out.append({"product_id": pid, "name": names.get(pid, f"#{pid}"), "dst_row_id": d["id"],
-                        "src": (s["brand1_id"], s["brand2_id"]), "dst": (d["brand1_id"], d["brand2_id"])})
+                        "src": s_b, "dst": d_b, "keys": keys})
     return out
 
 
@@ -458,7 +472,7 @@ def apply_brand_sync(diffs: list, dst_clinic_id: int) -> tuple:
     ok, errors = 0, []
     for d in diffs:
         try:
-            sb.table("clinic_stock").update({"brand1_id": d["src"][0], "brand2_id": d["src"][1]}) \
+            sb.table("clinic_stock").update(dict(zip(d["keys"], d["src"]))) \
               .eq("id", d["dst_row_id"]).eq("clinic_id", dst_clinic_id).execute()
             ok += 1
         except Exception as e:
@@ -2974,9 +2988,10 @@ def page_items():
     sync_brands = bool(load_global_params()["sync_brands"])
     other_names = [c["name"] for c in load_clinics() if c["id"] != clinic_id]
 
-    # 載入 per-clinic 資料
+    # 載入 per-clinic 資料（第三廠牌 brand3_id 需 migration_v10）
+    has_b3 = clinic_stock_has_brand3()
     cs_data = sb.table("clinic_stock").select(
-        "product_id, brand1_id, brand2_id, is_active, cabinet"
+        "product_id, brand1_id, brand2_id, is_active, cabinet" + (", brand3_id" if has_b3 else "")
     ).eq("clinic_id", clinic_id).execute().data
     cs_map = {s["product_id"]: s for s in cs_data}
 
@@ -2988,7 +3003,7 @@ def page_items():
     with tab_list:
         st.caption(f"📍 顯示 **{selected_clinic}** 的廠牌與啟用狀態")
         if sync_brands and other_names:
-            st.info(f"🔗 診所間廠牌同步已開啟：在此修改「第一/第二廠牌」會同步套用到 {'、'.join(other_names)} 的同一品項"
+            st.info(f"🔗 診所間廠牌同步已開啟：在此修改「第一/第二/第三廠牌」會同步套用到 {'、'.join(other_names)} 的同一品項"
                     "（櫃位、啟用狀態仍各診所獨立）。可在「系統設定 → 參數」關閉。")
 
         col1, col2, col3 = st.columns([2, 2, 3])
@@ -3020,13 +3035,16 @@ def page_items():
             if search and not match_search(p["name"], key_index.get(p["name"], ("", "")), search):
                 continue
 
-            rows.append({
+            row = {
                 "品項名稱": p["name"], "分類": p["categories"]["name"], "單位": p["units"]["name"],
                 "櫃位": cs.get("cabinet") or "",
                 "第一廠牌": brand_map.get(cs.get("brand1_id"), "-"),
                 "第二廠牌": brand_map.get(cs.get("brand2_id"), "-"),
-                "規格": p["spec_note"] or "-", "啟用": is_active,
-            })
+            }
+            if has_b3:
+                row["第三廠牌"] = brand_map.get(cs.get("brand3_id"), "-")
+            row.update({"規格": p["spec_note"] or "-", "啟用": is_active})
+            rows.append(row)
             product_ids.append(p["id"])
 
         if rows:
@@ -3044,6 +3062,7 @@ def page_items():
                         "櫃位": st.column_config.TextColumn(),
                         "第一廠牌": st.column_config.SelectboxColumn(options=brand_names),
                         "第二廠牌": st.column_config.SelectboxColumn(options=brand_names),
+                        "第三廠牌": st.column_config.SelectboxColumn(options=brand_names),
                         "規格": st.column_config.TextColumn(),
                         "啟用": st.column_config.CheckboxColumn(),
                     },
@@ -3088,6 +3107,8 @@ def page_items():
                             cs_changes["brand1_id"] = next((b["id"] for b in brands if b["name"] == new["第一廠牌"]), None)
                         if old["第二廠牌"] != new["第二廠牌"]:
                             cs_changes["brand2_id"] = next((b["id"] for b in brands if b["name"] == new["第二廠牌"]), None)
+                        if has_b3 and old["第三廠牌"] != new["第三廠牌"]:
+                            cs_changes["brand3_id"] = next((b["id"] for b in brands if b["name"] == new["第三廠牌"]), None)
                         if old["啟用"] != new["啟用"]:
                             cs_changes["is_active"] = bool(new["啟用"])
 
@@ -3097,7 +3118,7 @@ def page_items():
                                 "product_id", pid).eq("clinic_id", clinic_id).execute()
                             updated += 1
                             # 診所間廠牌同步：只同步第一/第二廠牌到其他診所（櫃位/啟用狀態不同步）
-                            brand_changes = {k: v for k, v in cs_changes.items() if k in ("brand1_id", "brand2_id")}
+                            brand_changes = {k: v for k, v in cs_changes.items() if k in BRAND_ID_KEYS}
                             if sync_brands and brand_changes and other_names:
                                 sb.table("clinic_stock").update(brand_changes).eq(
                                     "product_id", pid).neq("clinic_id", clinic_id).execute()
@@ -3708,14 +3729,19 @@ def page_settings():
     sb = get_supabase_client()
 
     if role == "admin":
-        tab_params, tab_cats, tab_brands, tab_units, tab_users = st.tabs([
-            "📊 參數", "📂 分類", "🏭 廠牌", "📏 單位", "👤 帳號"
+        tab_params, tab_price, tab_cats, tab_brands, tab_units, tab_users = st.tabs([
+            "📊 參數", "💰 進價表參數", "📂 分類", "🏭 廠牌", "📏 單位", "👤 帳號"
         ])
     else:
-        tab_params, tab_cats, tab_brands, tab_units = st.tabs([
-            "📊 參數", "📂 分類", "🏭 廠牌", "📏 單位"
+        tab_params, tab_price, tab_cats, tab_brands, tab_units = st.tabs([
+            "📊 參數", "💰 進價表參數", "📂 分類", "🏭 廠牌", "📏 單位"
         ])
         tab_users = None
+
+    # ── 進價 / 成本表參數（廠牌欄位、成本倍數、高價界線）──
+    with tab_price:
+        from pages_price import render_price_params_tab  # 延遲匯入避免循環引用
+        render_price_params_tab()
 
     # ── 參數：全域（平均耗用計算次數 / 異常閾值）＋ 各分類（備貨倍數 / 安全係數，可依櫃位 A–D）──
     with tab_params:
@@ -3774,8 +3800,8 @@ def page_settings():
                         st.markdown(f"**{d['name']}** 有 {len(rows)} 個品項與 {src_name} 不同：")
                         st.dataframe(pd.DataFrame([{
                             "品項": r["name"],
-                            f"{d['name']} 目前": f"{_bn(r['dst'][0])} / {_bn(r['dst'][1])}",
-                            f"改為（{src_name}）": f"{_bn(r['src'][0])} / {_bn(r['src'][1])}",
+                            f"{d['name']} 目前": " / ".join(_bn(b) for b in r["dst"]),
+                            f"改為（{src_name}）": " / ".join(_bn(b) for b in r["src"]),
                         } for r in rows]), hide_index=True, use_container_width=True,
                             height=min(len(rows) * 35 + 38, 400))
                     if st.button(f"✅ 確認同步（{total} 筆）", type="primary", key="sync_apply"):

@@ -30,6 +30,7 @@ from pages_app import (
     page_stock_overview, page_transactions, page_inventory,
     page_items, page_analytics, page_order, page_settings,
 )
+from pages_price import page_price
 
 
 def main():
@@ -58,7 +59,7 @@ def main():
         st.session_state.selected_clinic = selected_clinic
         st.divider()
 
-        # 選單順序：庫存 → 進退貨登錄 → 執行盤點 → 品項管理 → 數據分析 → 叫貨出表 → 系統設定 → 登出
+        # 選單順序：庫存 → 進退貨登錄 → 執行盤點 → 品項管理 → 數據分析 → 叫貨出表 → 進價/成本表 → 系統設定 → 登出
         menu_items = [
             "📦 庫存",
             "📥 進退貨登錄",
@@ -66,6 +67,7 @@ def main():
             "📋 品項管理",
             "📊 數據分析",
             "🛒 叫貨出表",
+            "💰 進價/成本表",
         ]
 
         if role in ("admin", "manager"):
@@ -93,6 +95,8 @@ def main():
         page_analytics()
     elif choice == "🛒 叫貨出表":
         page_order()
+    elif choice == "💰 進價/成本表":
+        page_price()
     elif choice == "⚙️ 系統設定":
         page_settings()
 
