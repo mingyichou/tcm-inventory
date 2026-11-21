@@ -82,22 +82,43 @@ def fmt_multiplier(v) -> str:
     return f"{float(v):.6f}".rstrip("0").rstrip(".")
 
 
+_PRICE_NOTE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*[（(]\s*([^()（）]+?)\s*[)）]$")
+
+
 def parse_price_cell(text):
-    """表格字串 → (price, note)。數字 → 進價；空白 → 都 None（＝刪除）；其他文字（時價/無…）→ note。"""
+    """表格字串 → (price, note)。數字 → 進價；「240(無)」→ 進價 240 + 備註「無」；
+    空白 → 都 None（＝刪除）；其他文字（時價…）→ 只有 note。"""
     s = "" if text is None else str(text).strip()
     if s in ("", "nan", "None", "-"):
         return None, None
+    m = _PRICE_NOTE_RE.match(s)
+    if m:
+        return float(m.group(1)), m.group(2)[:50]
     try:
         return float(s.replace(",", "")), None
     except ValueError:
         return None, s[:50]
 
 
+def _fmt_num(p) -> str:
+    p = float(p)
+    return str(int(p)) if p.is_integer() else f"{p:g}"
+
+
 def fmt_price(price, note=None) -> str:
     if price is not None:
-        p = float(price)
-        return str(int(p)) if p.is_integer() else f"{p:g}"
+        return f"{_fmt_num(price)}({note})" if note else _fmt_num(price)
     return note or ""
+
+
+def _row_remarks(pid, brands_k, prices) -> str:
+    """同時有進價與備註的格（如 莊松榮 240 + 無）→ 匯出時集中在「備註」欄：莊松榮:無"""
+    out = []
+    for b in brands_k:
+        pr = prices.get((pid, b["brand_id"]))
+        if pr and pr["price"] is not None and pr.get("note"):
+            out.append(f"{b['name']}:{pr['note']}")
+    return "、".join(out)
 
 
 def _sort_name(name: str) -> str:
@@ -406,8 +427,12 @@ def build_price_workbook(tables: dict, prices: dict, high: dict, as_of: date) ->
         rows, brands_k = tables[kind]
         ws = wb.create_sheet(f"科學中藥-{kind}")
         ncol = 2 + len(brands_k)
-        _setup_sheet(ws, kind, {"A": 4.5, "B": 16 if kind == "複方" else 11.4,
-                                **{ws.cell(3, 3 + i).column_letter: 9 for i in range(len(brands_k))}})
+        has_remark = any(_row_remarks(x["pid"], brands_k, prices) for x in rows)
+        widths = {"A": 4.5, "B": 16 if kind == "複方" else 11.4,
+                  **{ws.cell(3, 3 + i).column_letter: 9 for i in range(len(brands_k))}}
+        if has_remark:
+            widths[ws.cell(3, ncol + 1).column_letter] = 12
+        _setup_sheet(ws, kind, widths)
         d = ws.cell(1, ncol, as_of)
         d.number_format = "yyyy/mm"
         d.font = _FONT
@@ -415,6 +440,8 @@ def build_price_workbook(tables: dict, prices: dict, high: dict, as_of: date) ->
         _write_cell(ws, 3, 2, "品項")
         for i, b in enumerate(brands_k):
             _write_cell(ws, 3, 3 + i, b["name"])
+        if has_remark:
+            _write_cell(ws, 3, ncol + 1, "備註")
         r = 4
         for section, sec in _iter_sections(rows):
             if section == "自費":
@@ -437,6 +464,8 @@ def build_price_workbook(tables: dict, prices: dict, high: dict, as_of: date) ->
                             cell.font = _FONT_ORANGE
                     elif pr["note"]:
                         cell.value = pr["note"]
+                if has_remark:
+                    _write_cell(ws, r, ncol + 1, _row_remarks(x["pid"], brands_k, prices) or None)
                 r += 1
     buf = io.BytesIO()
     wb.save(buf)
@@ -452,11 +481,13 @@ def build_cost_workbook(tables: dict, prices: dict, high: dict, brand_map: dict,
         ws = wb.create_sheet(f"科學中藥-{kind}")
         nb = len(brands_k)
         extra = ("廠1", "廠2", "廠3", "櫃")
+        if any(_row_remarks(x["pid"], brands_k, prices) for x in rows):
+            extra = extra + ("備註",)
         widths = {"A": 3.8, "B": 17.4 if kind == "複方" else 12.8}
         for i in range(nb):
             widths[ws.cell(3, 3 + i).column_letter] = 7
-        for j in range(len(extra)):
-            widths[ws.cell(3, 3 + nb + j).column_letter] = 5.5
+        for j, h in enumerate(extra):
+            widths[ws.cell(3, 3 + nb + j).column_letter] = 12 if h == "備註" else 5.5
         _setup_sheet(ws, kind, widths)
         ws.cell(1, 2, f"{clinic_name}  {date.today():%Y/%m/%d}").font = _FONT
         _write_cell(ws, 3, 1)
@@ -491,6 +522,8 @@ def build_cost_workbook(tables: dict, prices: dict, high: dict, brand_map: dict,
                 for j, key in enumerate(("b1", "b2", "b3")):
                     _write_cell(ws, r, 3 + nb + j, _abbr(brand_map.get(x[key])) or None)
                 _write_cell(ws, r, 3 + nb + 3, x["cabinet"] or None)
+                if len(extra) == 5:
+                    _write_cell(ws, r, 3 + nb + 4, _row_remarks(x["pid"], brands_k, prices) or None)
                 r += 1
     buf = io.BytesIO()
     wb.save(buf)
@@ -504,7 +537,7 @@ def build_cost_workbook(tables: dict, prices: dict, high: dict, brand_map: dict,
 def _render_price_table(kind, rows, brands_k, prices, high):
     edit = st.toggle("✏️ 編輯進價", key=f"price_edit_{kind}")
     st.caption(f"成本 = 進價 × 廠牌倍數；成本 ≥ {high:g} 的進價以橘色粗體標示。"
-               + ("直接在表格填寫後按「儲存進價」；清空＝刪除，可填「時價」等文字。" if edit
+               + ("直接在表格填寫後按「儲存進價」；清空＝刪除，可填「時價」等文字，或「240(無)」＝進價 240 加備註。" if edit
                   else "開啟「編輯進價」即可填寫。"))
     for section, sec in _iter_sections(rows):
         st.markdown(f"**{SECTION_LABEL[section]}**（{len(sec)} 項）")
