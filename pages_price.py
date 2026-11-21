@@ -63,15 +63,17 @@ def is_auto_price_category(cat_name) -> bool:
 _VARIANTS = str.maketrans({"蔘": "參", "术": "朮", "姜": "薑", "芪": "耆", "荆": "荊"})
 
 
-def _norm_name(name) -> str:
-    """品名正規化（找同名健保品項用）：去括號註記、去 特./特級、去 -規格 後綴、異體字統一。"""
+def _norm_name(name, strip_b: bool = True) -> str:
+    """品名正規化（找同名健保品項用）：去括號註記、去 特./特級、去 -規格 後綴、異體字統一。
+    strip_b=True 時另去掉健保「B」版本尾碼（天麻B → 天麻），讓 特.天麻 能對應 天麻B。"""
     s = str(name).strip().replace("（", "(").replace("）", ")")
     s = re.sub(r"\(.*?\)", "", s)
     s = re.sub(r"[-－—]+.*$", "", s)
     s = re.sub(r"^特[.．級]", "", s)
     for a, b in (("瓜蔞", "栝樓"), ("栝婁", "栝樓"), ("栝簍", "栝樓"), ("栝蔞", "栝樓"), ("龜粄", "龜板")):
         s = s.replace(a, b)
-    return re.sub(r"\s+", "", s.translate(_VARIANTS))
+    s = re.sub(r"\s+", "", s.translate(_VARIANTS))
+    return re.sub(r"(?<=[一-鿿])[BＢ]$", "", s) if strip_b else s
 
 
 def _cat_of(p, cat_names: dict) -> str:
@@ -99,9 +101,12 @@ def build_linked_sources(products: list, cat_names: dict) -> dict:
         if not cands:
             continue
         if len(cands) > 1:
+            # 多候選：先排除「B」版本（延胡索 vs 延胡索B 取延胡索），再取去掉「特.」後完全同名者，否則取最短名
+            plain = _norm_name(p["name"], strip_b=False)
+            non_b = [c for c in cands if _norm_name(c["name"], strip_b=False) == plain]
             bare = re.sub(r"^特[.．]", "", p["name"]).strip()
-            exact = [c for c in cands if c["name"].strip() == bare]
-            cands = exact or sorted(cands, key=lambda c: len(c["name"]))
+            exact = [c for c in (non_b or cands) if c["name"].strip() == bare]
+            cands = exact or sorted(non_b or cands, key=lambda c: len(c["name"]))
         out[p["id"]] = cands[0]["id"]
     return out
 
