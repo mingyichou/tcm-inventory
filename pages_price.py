@@ -4,6 +4,8 @@
 表格三區（由上而下）：健保藥 → 特級用藥（高貴藥材；與健保不重複，進價手填）→ 特.用藥（自費科中；健保品項的映射，
 只是選用不同廠牌，進價自動複製同名健保品項、不可手填，廠牌可編輯）。
 預設只列啟用中的品項，但「特.」品項的健保來源即使停用也列出（天麻B ← 特.天麻），否則無處填價；可切換顯示全部。
+進價填入區自動歸位（plan_price_moves）：同一藥的 健保／特.／特級 版本，健保或特. 仍啟用 → 進價歸健保區（特級版停用則其進價搬到健保）；
+健保與特. 全停用、只剩特級版 → 進價歸特級區（健保進價自動搬過去）。
 
 資料表（migration_v10_prices.sql）：
   product_prices       product_id × brand_id → price（數字）或 note（文字，如「時價」「無」）
@@ -34,8 +36,8 @@ KINDS = ("複方", "單方")
 SECTIONS = ("健保", "高貴", "自費")
 SECTION_LABEL = {"健保": "健保藥", "高貴": "特級用藥（高貴藥）", "自費": "特.用藥（自費藥）"}
 SECTION_NOTE = {
-    "健保": "科學中藥複方／單方（含水藥材、非健保藥材）；進價在此填寫。",
-    "高貴": "高貴藥材；品項與健保藥不重複（如 特級阿膠），進價在此填寫。",
+    "健保": "科學中藥複方／單方（含水藥材、非健保藥材）；進價在此填寫。同一藥只要健保或特. 版仍啟用，進價就填在這裡。",
+    "高貴": "高貴藥材；品項與健保藥不重複（如 特級阿膠），進價在此填寫。健保與特. 版都停用、只剩特級版時，原健保進價會自動搬到這裡。",
     "自費": "自費科中「特.」品項＝健保藥的映射，只是選用不同廠牌；進價自動複製同名健保品項、不可手填，廠1/2/3 在成本表編輯。",
 }
 EXCEL_MARKER = {"高貴": "特級用藥(高貴藥)", "自費": "特.用藥(自費藥)"}   # 匯出時各區前的標記列（原表只有「自費藥」）
@@ -123,6 +125,55 @@ def build_linked_sources(products: list, cat_names: dict) -> dict:
             cands = exact or sorted(non_b or cands, key=lambda c: len(c["name"]))
         out[p["id"]] = cands[0]["id"]
     return out
+
+
+def plan_price_moves(products: list, cat_names: dict, cs_any: dict, prices: dict) -> list:
+    """進價填入區自動歸位。同名（正規化、同單複方）的 健保／特.／高貴 品項視為同一藥：
+       - 健保或任一特. 仍啟用 → 進價歸健保；高貴版若已全部停用，其進價搬到健保品項
+       - 健保與特. 全停用、高貴版啟用 → 進價歸高貴；健保品項的進價搬到高貴品項
+    只處理「恰有一個健保、一個高貴」的組合，避免誤判。cs_any=load_clinic_stock_brands(None)（任一診所啟用即 is_active）。
+    回傳 [{"from", "to", "cells":[price rows 要補到 to 的], "drop":[from 的所有 (pid, brand_id)]}]，不寫 DB。"""
+    fam = {}
+    for p in products:
+        cname = _cat_of(p, cat_names)
+        fam.setdefault((product_kind(cname), _norm_name(p["name"])), {"健保": [], "高貴": [], "自費": []})[product_section(cname)].append(p)
+
+    def active(p):
+        return bool((cs_any.get(p["id"]) or {}).get("is_active"))
+
+    plan = []
+    for members in fam.values():
+        if len(members["健保"]) != 1 or len(members["高貴"]) != 1:
+            continue
+        h, g = members["健保"][0], members["高貴"][0]
+        if active(h) or any(active(t) for t in members["自費"]):
+            frm, to = (g, h) if not active(g) else (None, None)
+        elif active(g):
+            frm, to = h, g
+        else:
+            frm, to = None, None
+        if frm is None:
+            continue
+        own = {(pid, bid): v for (pid, bid), v in prices.items() if pid == frm["id"]}
+        if not own:
+            continue
+        cells = [{"product_id": to["id"], "brand_id": bid, "price": v["price"], "note": v["note"]}
+                 for (pid, bid), v in own.items() if (to["id"], bid) not in prices]
+        plan.append({"from": frm, "to": to, "cells": cells, "drop": list(own)})
+    return plan
+
+
+def apply_price_moves(plan: list) -> None:
+    sb = get_supabase_client()
+    uid = (st.session_state.get("user") or {}).get("id")
+    now = datetime.now().isoformat(timespec="seconds")
+    for m in plan:
+        if m["cells"]:
+            sb.table("product_prices").upsert([{**c, "updated_at": now, "updated_by": uid} for c in m["cells"]],
+                                              on_conflict="product_id,brand_id").execute()
+        sb.table("product_prices").delete().eq("product_id", m["from"]["id"]).execute()
+    if plan:
+        load_product_prices.clear()
 
 
 def _price_of(prices: dict, row: dict, brand_id: int):
@@ -749,6 +800,15 @@ def page_price():
     brands = load_brands()
     brand_map = {b["id"]: b["name"] for b in brands}
     linked = build_linked_sources(products, cat_names)
+    moves = plan_price_moves(products, cat_names, load_clinic_stock_brands(None), prices)
+    if moves:
+        try:
+            apply_price_moves(moves)
+            prices = load_product_prices()
+            st.info("進價已依啟用狀態自動歸位：" + "；".join(
+                f"{m['from']['name']} → {m['to']['name']}（{len(m['cells'])} 格）" for m in moves))
+        except Exception as e:
+            st.warning(f"進價自動歸位失敗：{e}")
     with c1:
         show_inactive = st.toggle("顯示停用品項", key="price_show_inactive",
                                   help="預設只列啟用中的品項；「特.」品項的健保來源（如 天麻B）即使停用也會列出以便填價。"
