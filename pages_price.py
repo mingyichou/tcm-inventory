@@ -101,8 +101,9 @@ def _cat_of(p, cat_names: dict) -> str:
     return cat_names.get(p["category_id"]) or (p.get("categories") or {}).get("name", "")
 
 
-def build_linked_sources(products: list, cat_names: dict) -> dict:
-    """{特.品項 id: 同名健保品項 id}（同單複方、正規化品名相同；多個候選時取去掉「特.」後完全同名者，否則取最短名）。
+def build_linked_sources(products: list, cat_names: dict, cs_any: dict | None = None) -> dict:
+    """{特.品項 id: 同名健保品項 id}（同單複方、正規化品名相同）。多個候選時：先取任一診所仍啟用者
+    （cs_any=load_clinic_stock_brands(None)；天麻B 停用 vs 天麻B(複方密環素) 啟用 → 後者），再取去掉「特.」後完全同名者，否則取最短名。
     沒有同名健保品項時退而對應同名「高貴藥材」品項（如 特.吳茱萸湯 → 特級吳茱萸湯）。"""
     by_key, by_key_precious = {}, {}
     for p in products:
@@ -122,6 +123,10 @@ def build_linked_sources(products: list, cat_names: dict) -> dict:
         cands = by_key.get(key) or by_key_precious.get(key) or []
         if not cands:
             continue
+        if len(cands) > 1 and cs_any:
+            # 多候選：優先取仍啟用的來源（停用的舊名不該再當特. 的價格來源）
+            act = [c for c in cands if (cs_any.get(c["id"]) or {}).get("is_active")]
+            cands = act or cands
         if len(cands) > 1:
             # 多候選：先排除「B」版本（延胡索 vs 延胡索B 取延胡索），再取去掉「特.」後完全同名者，否則取最短名
             plain = _norm_name(p["name"], strip_b=False)
@@ -849,8 +854,9 @@ def page_price():
     prices = load_product_prices()
     brands = load_brands()
     brand_map = {b["id"]: b["name"] for b in brands}
-    linked = build_linked_sources(products, cat_names)
-    moves = plan_price_moves(products, cat_names, load_clinic_stock_brands(None), prices)
+    cs_any = load_clinic_stock_brands(None)
+    linked = build_linked_sources(products, cat_names, cs_any)
+    moves = plan_price_moves(products, cat_names, cs_any, prices)
     if moves:
         try:
             apply_price_moves(moves)
