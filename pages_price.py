@@ -3,7 +3,8 @@
 
 表格三區（由上而下）：健保藥 → 特級用藥（高貴藥材；與健保不重複，進價手填）→ 特.用藥（自費科中；健保品項的映射，
 只是選用不同廠牌，進價自動複製同名健保品項、不可手填，廠牌可編輯）。
-預設只列啟用中的品項，但「特.」品項的健保來源即使停用也列出（天麻B ← 特.天麻），否則無處填價；可切換顯示全部。
+預設列「兩診所任一啟用」的品項（進價全院共用：麥芽 澤沛啟用、澤豐停用 → 澤豐檢視也入表，品名標「（澤豐停用）」、斜體，
+廠1/2/3、櫃位仍顯示所選診所的），再加上「特.」品項的健保來源即使停用也列出（天麻B ← 特.天麻），否則無處填價；可切換顯示全部。
 進價填入區自動歸位（plan_price_moves）：同一藥的 健保／特.／特級 版本，健保或特. 仍啟用 → 進價歸健保區（特級版停用則其進價搬到健保）；
 健保與特. 全停用、只剩特級版 → 進價歸特級區（健保進價自動搬過去）。
 🔍 搜尋品項（進價表／成本表共用、兩個 tab 同時過濾；成本表可搜廠牌／櫃位）只過濾畫面、不影響 Excel 匯出；
@@ -49,6 +50,7 @@ SECTION_NOTE = {
 EXCEL_MARKER = {"高貴": "特級用藥(高貴藥)", "自費": "特.用藥(自費藥)"}   # 匯出時各區前的標記列（原表只有「自費藥」）
 INACTIVE_CSS = "color:#9E9E9E;font-style:italic"
 INACTIVE_RGB = "9E9E9E"
+OTHER_CLINIC_CSS = "font-style:italic"     # 所選診所停用、另一診所啟用（進價全院共用，仍入表）
 HIGH_PRICE_KEYS = {"單方": "high_price_single", "複方": "high_price_compound"}
 DEFAULT_HIGH_PRICE = {"單方": 280.0, "複方": 450.0}
 ORANGE = "FFC000"
@@ -263,8 +265,21 @@ def _row_remarks(row, brands_k, prices) -> str:
 
 
 def _display_name(r: dict) -> str:
-    """停用品項在畫面上加註（停用）；匯出 Excel 不加字、改灰字。"""
-    return r["name"] if r.get("active", True) else f"{r['name']}（停用）"
+    """畫面品名：兩診所都停用加註（停用）；所選診所停用、另一院啟用加註（澤豐停用）。匯出 Excel 不加字、改灰字／斜體。"""
+    if not r.get("active", True):
+        return f"{r['name']}（停用）"
+    if not r.get("active_here", True):
+        return f"{r['name']}（{r.get('here') or '本院'}停用）"
+    return r["name"]
+
+
+def _name_css(r: dict, base: str = "") -> str:
+    """畫面品名 css：停用灰字斜體；所選診所停用（他院啟用）斜體疊在 base（成本表櫃位色）上。"""
+    if not r.get("active", True):
+        return INACTIVE_CSS
+    if not r.get("active_here", True):
+        return ";".join(x for x in (base, OTHER_CLINIC_CSS) if x)
+    return base
 
 
 def _cabinet_letter(cabinet) -> str:
@@ -390,12 +405,15 @@ def invalidate_price_cache():
 # ══════════════════════════════════════════════
 
 def build_rows(kind: str, cs_map: dict, products: list, cat_names: dict, linked: dict | None = None,
-               include_inactive: bool = False) -> list:
-    """kind（單方/複方）的品項列，依 區段(健保→高貴→自費) → 首字注音 → 全字注音 排序。
-    預設只列診所啟用中的品項；但已列出的「特.」品項其健保來源即使停用也一併列出（特.天麻 → 天麻B），
-    否則來源無處填價。include_inactive=True 則全部列出。列的 active=False 表示停用（畫面灰字）。
+               include_inactive: bool = False, cs_any: dict | None = None, here: str | None = None) -> list:
+    """kind（單方/複方）的品項列，依 區段(健保→高貴→自費) → 分類 → 首字注音 → 櫃位 → 全字注音 排序。
+    啟用判斷用 cs_any（load_clinic_stock_brands(None)：兩診所任一啟用即算啟用；進價全院共用，麥芽 澤沛啟用、澤豐停用 也要入表），
+    沒給 cs_any 才只看 cs_map。廠1/2/3、櫃位（含排序用）取 cs_map＝所選診所；列的 active_here=False 表示所選診所停用、另一院啟用
+    （畫面品名加「（{here}停用）」、斜體；here=所選診所名）。已列出的「特.」品項其健保來源即使停用也一併列出（特.天麻 → 天麻B），
+    否則來源無處填價。include_inactive=True 則全部列出。列的 active=False 表示兩診所都停用（畫面灰字）。
     linked：build_linked_sources() 結果；特. 品項列帶 auto=True、src=來源品項 id（可能 None＝找不到）、src_section=來源區段。"""
     linked = linked or {}
+    act_map = cs_any if cs_any is not None else cs_map
     sec_by_pid = {p["id"]: product_section(_cat_of(p, cat_names)) for p in products}
     cands = []
     for p in products:
@@ -403,7 +421,7 @@ def build_rows(kind: str, cs_map: dict, products: list, cat_names: dict, linked:
         if product_kind(cname) != kind:
             continue
         cs = cs_map.get(p["id"]) or {}
-        cands.append((p, cname, cs, bool(cs.get("is_active")) if cs else False))
+        cands.append((p, cname, cs, bool((act_map.get(p["id"]) or {}).get("is_active"))))
     keep = {p["id"] for p, _, _, active in cands if active or include_inactive}
     for p, cname, _, _ in cands:
         if p["id"] in keep and is_auto_price_category(cname) and linked.get(p["id"]):
@@ -417,6 +435,7 @@ def build_rows(kind: str, cs_map: dict, products: list, cat_names: dict, linked:
             "initial": get_bopomofo_initial(p["name"]), "sort": get_bopomofo_sort_key(p["name"]),
             "cat_id": p.get("category_id") or 0,
             "cabinet": cs.get("cabinet") or "", "active": active,
+            "active_here": bool(cs.get("is_active")) if cs_any is not None else active, "here": here,
             "b1": cs.get("brand1_id"), "b2": cs.get("brand2_id"), "b3": cs.get("brand3_id"),
             "auto": is_auto_price_category(cname), "src": linked.get(p["id"]),
             "src_section": sec_by_pid.get(linked.get(p["id"])),
@@ -441,7 +460,7 @@ def _price_frame(sec_rows, brands_k, prices, high):
     data, css = [], []
     for r, lab in zip(sec_rows, _initial_labels(sec_rows)):
         rec = {"注音": lab, "品項": _display_name(r)}
-        crec = {"注音": "", "品項": "" if r.get("active", True) else INACTIVE_CSS}
+        crec = {"注音": "", "品項": _name_css(r)}
         for b in brands_k:
             pr = _price_of(prices, r, b["brand_id"])
             rec[b["name"]] = fmt_price(pr["price"], pr["note"]) if pr else ""
@@ -458,10 +477,7 @@ def _cost_frame(sec_rows, brands_k, prices, high, brand_map):
     for r, lab in zip(sec_rows, _initial_labels(sec_rows)):
         rec, crec = {"注音": lab, "品項": _display_name(r)}, {c: "" for c in cols}
         g = _cabinet_letter(r["cabinet"])
-        if not r.get("active", True):
-            crec["品項"] = INACTIVE_CSS
-        elif g in NAME_COLOR_BY_CABINET:
-            crec["品項"] = f"color:#{NAME_COLOR_BY_CABINET[g]}"
+        crec["品項"] = _name_css(r, f"color:#{NAME_COLOR_BY_CABINET[g]}" if g in NAME_COLOR_BY_CABINET else "")
         for b in brands_k:
             pr = _price_of(prices, r, b["brand_id"])
             cost = calc_cost(pr["price"], b["multiplier"]) if pr else None
@@ -597,6 +613,13 @@ def _font_color(rgb: str) -> Font:
     return Font(name="新細明體", size=11, color=rgb)
 
 
+def _name_font(x: dict, rgb: str | None = None) -> Font:
+    """Excel 品名字型：兩診所都停用灰字；所選診所停用（他院啟用）斜體；rgb＝成本表櫃位色（A 紅／C 藍）。"""
+    if not x.get("active", True):
+        return _font_color(INACTIVE_RGB)
+    return Font(name="新細明體", size=11, color=rgb, italic=not x.get("active_here", True))
+
+
 def _setup_sheet(ws, kind: str, widths: dict):
     ws.page_setup.orientation = "portrait"
     ws.page_setup.paperSize = 9  # A4
@@ -655,7 +678,7 @@ def build_price_workbook(tables: dict, prices: dict, high: dict, as_of: date) ->
                 r += 1
             for x, lab in zip(sec, _initial_labels(sec)):
                 _write_cell(ws, r, 1, lab or None)
-                _write_cell(ws, r, 2, x["name"], font=_FONT if x.get("active", True) else _font_color(INACTIVE_RGB))
+                _write_cell(ws, r, 2, x["name"], font=_name_font(x))
                 for i, b in enumerate(brands_k):
                     pr = _price_of(prices, x, b["brand_id"])
                     cell = _write_cell(ws, r, 3 + i)
@@ -710,11 +733,7 @@ def build_cost_workbook(tables: dict, prices: dict, high: dict, brand_map: dict,
             for x, lab in zip(sec, _initial_labels(sec)):
                 _write_cell(ws, r, 1, lab or None)
                 g = _cabinet_letter(x["cabinet"])
-                if not x.get("active", True):
-                    name_font = _font_color(INACTIVE_RGB)
-                else:
-                    name_font = _font_color(NAME_COLOR_BY_CABINET[g]) if g in NAME_COLOR_BY_CABINET else _FONT
-                _write_cell(ws, r, 2, x["name"], font=name_font)
+                _write_cell(ws, r, 2, x["name"], font=_name_font(x, NAME_COLOR_BY_CABINET.get(g)))
                 for i, b in enumerate(brands_k):
                     pr = _price_of(prices, x, b["brand_id"])
                     cell = _write_cell(ws, r, 3 + i)
@@ -868,9 +887,11 @@ def page_price():
             st.warning(f"進價自動歸位失敗：{e}")
     with c1:
         show_inactive = st.toggle("顯示停用品項", key="price_show_inactive",
-                                  help="預設只列啟用中的品項；「特.」品項的健保來源（如 天麻B）即使停用也會列出以便填價。"
-                                       "開啟後列出全部品項（灰字＝停用），匯出的 Excel 也跟著變。")
-    tables = {k: (build_rows(k, cs_map, products, cat_names, linked, include_inactive=show_inactive),
+                                  help="預設列兩診所任一啟用的品項（進價全院共用；所選診所停用、另一院啟用者品名標「（澤豐停用）」、斜體）；"
+                                       "「特.」品項的健保來源（如 天麻B）即使停用也會列出以便填價。"
+                                       "開啟後列出全部品項（灰字＝兩診所都停用），匯出的 Excel 也跟著變。")
+    tables = {k: (build_rows(k, cs_map, products, cat_names, linked, include_inactive=show_inactive,
+                             cs_any=cs_any, here=None if clinic_id is None else clinic_name),
                   [b for b in ptb if b["kind"] == k]) for k in KINDS}
 
     with c2:
@@ -884,8 +905,9 @@ def page_price():
                                build_price_workbook(tables, prices, high, date.today()),
                                file_name=f"科中進貨價目表_{date.today():%Y%m}.xlsx",
                                mime=XLSX_MIME, use_container_width=True)
-    scope = "全部品項（灰字＝停用）" if show_inactive else (
-        ("兩診所任一啟用" if clinic_id is None else f"**{clinic_name}** 啟用中") + " 的品項，加上「特.」品項的健保來源（停用者灰字）")
+    scope = "全部品項（灰字＝兩診所都停用）" if show_inactive else (
+        "兩診所任一啟用的品項" + ("" if clinic_id is None else f"（{clinic_name} 停用、另一院啟用者標「（{clinic_name}停用）」斜體）")
+        + "，加上「特.」品項的健保來源（停用者灰字）")
     if is_cost:
         st.caption(f"📍 廠牌 / 櫃位：**{clinic_name}**；進價與成本為全院共用。顯示 {scope}。")
     else:
