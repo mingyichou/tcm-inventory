@@ -7,6 +7,9 @@
 進價填入區自動歸位（plan_price_moves）：同一藥的 健保／特.／特級 版本，健保或特. 仍啟用 → 進價歸健保區（特級版停用則其進價搬到健保）；
 健保與特. 全停用、只剩特級版 → 進價歸特級區（健保進價自動搬過去）。
 🔍 搜尋品項（進價表／成本表共用、兩個 tab 同時過濾；成本表可搜廠牌／櫃位）只過濾畫面、不影響 Excel 匯出；
+關鍵字同庫存／品項管理：中文片段 或 注音首碼鍵盤對應（build_bopomofo_index／match_search：ee=葛根、2e=當歸、1c=白虎）。
+排列順序同庫存／品項管理（sort_products_by_bopomofo）：區段 → 分類 → 首字注音 → 櫃位（無櫃位排最後）→ 全字注音；
+所以 ㄅ 的第一個複方是 A 櫃的 白虎加人參湯，而非 B 櫃的 八正散。
 列底色分組（每 5 列／逐列／無，key price_band）＋ 注音/品項 欄凍結，方便左右對照。編輯模式下 Streamlit 只對不可編輯欄套用底色。
 
 資料表（migration_v10_prices.sql）：
@@ -32,7 +35,7 @@ from database import get_supabase_client, fetch_all, with_retry
 from pages_app import (
     load_products, load_brands, load_categories, load_clinics, get_clinic_id,
     load_global_params, invalidate_stock_cache, get_bopomofo_initial, get_bopomofo_sort_key,
-    BRAND_ABBR,
+    BRAND_ABBR, build_bopomofo_index, match_search,
 )
 
 KINDS = ("複方", "單方")
@@ -259,13 +262,6 @@ def _row_remarks(row, brands_k, prices) -> str:
     return "、".join(out)
 
 
-def _sort_name(name: str) -> str:
-    for prefix in ("特.", "特級"):
-        if name.startswith(prefix):
-            return name[len(prefix):]
-    return name
-
-
 def _display_name(r: dict) -> str:
     """停用品項在畫面上加註（停用）；匯出 Excel 不加字、改灰字。"""
     return r["name"] if r.get("active", True) else f"{r['name']}（停用）"
@@ -418,13 +414,16 @@ def build_rows(kind: str, cs_map: dict, products: list, cat_names: dict, linked:
             continue
         rows.append({
             "pid": p["id"], "name": p["name"], "cat": cname, "section": product_section(cname),
-            "initial": get_bopomofo_initial(p["name"]), "sort": get_bopomofo_sort_key(_sort_name(p["name"])),
+            "initial": get_bopomofo_initial(p["name"]), "sort": get_bopomofo_sort_key(p["name"]),
+            "cat_id": p.get("category_id") or 0,
             "cabinet": cs.get("cabinet") or "", "active": active,
             "b1": cs.get("brand1_id"), "b2": cs.get("brand2_id"), "b3": cs.get("brand3_id"),
             "auto": is_auto_price_category(cname), "src": linked.get(p["id"]),
             "src_section": sec_by_pid.get(linked.get(p["id"])),
         })
-    rows.sort(key=lambda r: (SECTIONS.index(r["section"]), r["initial"], r["sort"]))
+    # 同 pages_app.sort_products_by_bopomofo：分類 → 首字注音 → 櫃位（無櫃位排最後）→ 全字注音；最前面再加區段
+    rows.sort(key=lambda r: (SECTIONS.index(r["section"]), r["cat_id"], r["initial"],
+                             (r["cabinet"] or "").strip() or "\uffff", r["sort"]))
     return rows
 
 
@@ -491,9 +490,10 @@ def search_terms(q) -> list:
     return [unicodedata.normalize("NFKC", t).lower() for t in str(q or "").split() if t.strip()]
 
 
-def filter_rows(rows: list, terms: list, brand_map: dict | None = None) -> list:
-    """搜尋過濾：比對 品名（原名、正規化名、含「（停用）」的顯示名）、注音首字、櫃位；給 brand_map 時再比對 廠1/2/3 廠牌名。
-    多個關鍵字需全部符合（AND）。回傳順序不變（三區位置保留）。"""
+def filter_rows(rows: list, terms: list, brand_map: dict | None = None, key_index: dict | None = None) -> list:
+    """搜尋過濾。每個關鍵字可為：中文片段（原名、正規化名、含「（停用）」的顯示名）、注音首碼鍵盤對應
+    （key_index=build_bopomofo_index(...)，同庫存/品項管理：ee=葛根、2e=當歸、1c=白虎；特./特級 去掉前綴也算）、
+    注音首字、櫃位；給 brand_map 時再比對 廠1/2/3 廠牌名。多個關鍵字需全部符合（AND）。回傳順序不變（三區位置保留）。"""
     if not terms:
         return rows
     out = []
@@ -502,7 +502,8 @@ def filter_rows(rows: list, terms: list, brand_map: dict | None = None) -> list:
         if brand_map:
             parts += [brand_map.get(r.get(k)) or "" for k in ("b1", "b2", "b3") if r.get(k)]
         hay = unicodedata.normalize("NFKC", " ".join(parts)).lower()
-        if all(t in hay for t in terms):
+        keys = (key_index or {}).get(r["name"])
+        if all(t in hay or (keys is not None and match_search(r["name"], keys, t)) for t in terms):
             out.append(r)
     return out
 
@@ -893,15 +894,17 @@ def page_price():
     s1, s2 = st.columns([3, 2])
     with s1:
         query = st.text_input("🔍 搜尋品項", key="price_search",
-                              placeholder="品名關鍵字，可多個（空格分隔，如「半夏 天麻」）" + ("；也可搜廠牌、櫃位" if is_cost else ""),
-                              help="同時過濾 複方／單方 兩個 tab，三區位置不變；只影響畫面，Excel 匯出仍是完整表格。"
-                                   "改搜尋字之前請先按儲存，未存的編輯會被清掉。")
+                              placeholder="中文 或 注音首碼（ee=葛根、2e=當歸、1c=白虎），可多個關鍵字（空格分隔）"
+                                          + ("；也可搜廠牌、櫃位" if is_cost else ""),
+                              help="同庫存／品項管理的搜尋：中文片段或注音首碼鍵盤對應都可以；同時過濾 複方／單方 兩個 tab，三區位置不變；"
+                                   "只影響畫面，Excel 匯出仍是完整表格。改搜尋字之前請先按儲存，未存的編輯會被清掉。")
     with s2:
         band_label = st.selectbox("列底色分組（方便左右對照）", list(BAND_OPTIONS), key="price_band",
                                   help="每 5 列（或每列）交錯上底色，看橫列更不易串行。編輯模式下 Streamlit 只會替不可編輯的欄位上色。")
     band = BAND_OPTIONS.get(band_label, 5)
     terms = search_terms(query)
-    shown = {k: filter_rows(tables[k][0], terms, brand_map if is_cost else None) for k in KINDS}
+    key_index = build_bopomofo_index(tuple(sorted({r["name"] for k in KINDS for r in tables[k][0]}))) if terms else None
+    shown = {k: filter_rows(tables[k][0], terms, brand_map if is_cost else None, key_index) for k in KINDS}
     if terms:
         st.caption("🔍 符合「" + " ".join(terms) + "」：" + "、".join(f"{k} {len(shown[k])} 項" for k in KINDS)
                    + "。清空搜尋框即恢復完整表格。")
