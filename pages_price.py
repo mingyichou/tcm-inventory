@@ -6,6 +6,8 @@
 預設只列啟用中的品項，但「特.」品項的健保來源即使停用也列出（天麻B ← 特.天麻），否則無處填價；可切換顯示全部。
 進價填入區自動歸位（plan_price_moves）：同一藥的 健保／特.／特級 版本，健保或特. 仍啟用 → 進價歸健保區（特級版停用則其進價搬到健保）；
 健保與特. 全停用、只剩特級版 → 進價歸特級區（健保進價自動搬過去）。
+🔍 搜尋品項（進價表／成本表共用、兩個 tab 同時過濾；成本表可搜廠牌／櫃位）只過濾畫面、不影響 Excel 匯出；
+列底色分組（每 5 列／逐列／無，key price_band）＋ 注音/品項 欄凍結，方便左右對照。編輯模式下 Streamlit 只對不可編輯欄套用底色。
 
 資料表（migration_v10_prices.sql）：
   product_prices       product_id × brand_id → price（數字）或 note（文字，如「時價」「無」）
@@ -17,6 +19,7 @@
 import io
 import math
 import re
+import unicodedata
 from datetime import date, datetime
 from fractions import Fraction
 
@@ -50,6 +53,9 @@ ORANGE_CSS = "color:#E08E00;font-weight:700"
 # 成本表品名顏色（沿用原 Excel 慣例：A 櫃紅字、C 櫃藍字）
 NAME_COLOR_BY_CABINET = {"A": "C00000", "C": "00B0F0"}
 BRAND_COLS = (("廠1", "brand1_id"), ("廠2", "brand2_id"), ("廠3", "brand3_id"))
+# 列底色分組（方便左右對照）：選項 → 每幾列換一次底色；0 = 不分組。半透明色在深／淺色主題都看得到
+BAND_OPTIONS = {"每 5 列分組": 5, "逐列交錯": 1, "無": 0}
+BAND_CSS = "background-color:rgba(90,120,170,0.14)"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
@@ -473,6 +479,49 @@ def _table_height(n: int) -> int:
     return int(min(n * 35 + 38, 900))
 
 
+# ── 搜尋 / 可讀性 ──
+
+def search_terms(q) -> list:
+    """搜尋字串 → 關鍵字清單（空格分隔、全半形統一、不分大小寫）。"""
+    return [unicodedata.normalize("NFKC", t).lower() for t in str(q or "").split() if t.strip()]
+
+
+def filter_rows(rows: list, terms: list, brand_map: dict | None = None) -> list:
+    """搜尋過濾：比對 品名（原名、正規化名、含「（停用）」的顯示名）、注音首字、櫃位；給 brand_map 時再比對 廠1/2/3 廠牌名。
+    多個關鍵字需全部符合（AND）。回傳順序不變（三區位置保留）。"""
+    if not terms:
+        return rows
+    out = []
+    for r in rows:
+        parts = [r["name"], _norm_name(r["name"]), _display_name(r), r.get("initial") or "", r.get("cabinet") or ""]
+        if brand_map:
+            parts += [brand_map.get(r.get(k)) or "" for k in ("b1", "b2", "b3") if r.get(k)]
+        hay = unicodedata.normalize("NFKC", " ".join(parts)).lower()
+        if all(t in hay for t in terms):
+            out.append(r)
+    return out
+
+
+def _band_rows(n: int, size: int) -> list:
+    """第 i 列的底色 css：每 size 列一組、組與組交錯上色；size=0 → 全空。"""
+    return [BAND_CSS if size and (i // size) % 2 else "" for i in range(n)]
+
+
+def _styled(df: pd.DataFrame, css: pd.DataFrame, band: int):
+    """Styler：原有格式（橘字／灰字／櫃位色）疊上列底色分組。st.data_editor 只會對不可編輯欄套用。"""
+    full = css.copy()
+    for i, bg in enumerate(_band_rows(len(df), band)):
+        if bg:
+            full.iloc[i] = [";".join(x for x in (bg, c) if x) for c in css.iloc[i]]
+    return df.style.apply(lambda _: full, axis=None)
+
+
+def _view_cfg() -> dict:
+    """檢視模式欄位設定：注音窄欄、注音＋品項 凍結在左側（橫向捲動時仍看得到品名）。"""
+    return {"注音": st.column_config.TextColumn(width="small", pinned=True),
+            "品項": st.column_config.TextColumn(pinned=True)}
+
+
 # ══════════════════════════════════════════════
 #  儲存
 # ══════════════════════════════════════════════
@@ -687,7 +736,7 @@ def build_cost_workbook(tables: dict, prices: dict, high: dict, brand_map: dict,
 #  頁面
 # ══════════════════════════════════════════════
 
-def _render_price_table(kind, rows, brands_k, prices, high):
+def _render_price_table(kind, rows, brands_k, prices, high, band=0):
     edit = st.toggle("✏️ 編輯進價", key=f"price_edit_{kind}")
     st.caption(f"成本 = 進價 × 廠牌倍數；成本 ≥ {high:g} 的進價以橘色粗體標示。灰字＝停用品項。"
                + ("直接在表格填寫後按「儲存進價」；清空＝刪除，可填「時價」等文字，或「240(無)」＝進價 240 加備註。" if edit
@@ -697,19 +746,19 @@ def _render_price_table(kind, rows, brands_k, prices, high):
         st.caption(SECTION_NOTE[section])
         if not edit:
             df, css = _price_frame(sec, brands_k, prices, high)
-            st.dataframe(df.style.apply(lambda _: css, axis=None), hide_index=True,
-                         use_container_width=True, height=_table_height(len(df)))
+            st.dataframe(_styled(df, css, band), hide_index=True, use_container_width=True,
+                         height=_table_height(len(df)), column_config=_view_cfg())
             continue
         manual = [r for r in sec if not r["auto"]]
         auto = [r for r in sec if r["auto"]]
         if manual:
-            df, _ = _price_frame(manual, brands_k, prices, high)
-            cfg = {"注音": st.column_config.TextColumn(disabled=True, width="small"),
-                   "品項": st.column_config.TextColumn(disabled=True)}
+            df, css = _price_frame(manual, brands_k, prices, high)
+            cfg = {"注音": st.column_config.TextColumn(disabled=True, width="small", pinned=True),
+                   "品項": st.column_config.TextColumn(disabled=True, pinned=True)}
             for b in brands_k:
                 cfg[b["name"]] = st.column_config.TextColumn(width="small")
-            ed = st.data_editor(df, hide_index=True, use_container_width=True, height=_table_height(len(df)),
-                                column_config=cfg, key=f"price_ed_{kind}_{section}")
+            ed = st.data_editor(_styled(df, css, band), hide_index=True, use_container_width=True,
+                                height=_table_height(len(df)), column_config=cfg, key=f"price_ed_{kind}_{section}")
             if st.button("💾 儲存進價", type="primary", key=f"price_save_{kind}_{section}"):
                 n_up, n_del = save_price_edits(manual, brands_k, df, ed, prices)
                 if n_up or n_del:
@@ -724,11 +773,11 @@ def _render_price_table(kind, rows, brands_k, prices, high):
                        + (f"；找不到同名健保品項：{'、'.join(missing)}" if missing else "")
                        + (f"；系統無同名健保品項、暫以同名高貴藥材帶價（請確認分類）：{'、'.join(odd)}" if odd else "") + "。")
             adf, acss = _price_frame(auto, brands_k, prices, high)
-            st.dataframe(adf.style.apply(lambda _: acss, axis=None), hide_index=True,
-                         use_container_width=True, height=_table_height(len(adf)))
+            st.dataframe(_styled(adf, acss, band), hide_index=True, use_container_width=True,
+                         height=_table_height(len(adf)), column_config=_view_cfg())
 
 
-def _render_cost_table(kind, rows, brands_k, prices, high, brand_map, brands, clinic_id):
+def _render_cost_table(kind, rows, brands_k, prices, high, brand_map, brands, clinic_id, band=0):
     edit = st.toggle("✏️ 編輯廠牌（廠1 / 廠2 / 廠3）", key=f"cost_edit_{kind}")
     sync = bool(load_global_params()["sync_brands"])
     st.caption(f"成本 = 進價 × 廠牌倍數（無條件進位取整）；≥ {high:g} 橘色粗體。品名紅字＝A 櫃、藍字＝C 櫃、灰字＝停用。"
@@ -741,11 +790,12 @@ def _render_cost_table(kind, rows, brands_k, prices, high, brand_map, brands, cl
         df, css = _cost_frame(sec, brands_k, prices, high, brand_map)
         if edit:
             cfg = {c: st.column_config.TextColumn(disabled=True, width="small") for c in df.columns}
-            cfg["品項"] = st.column_config.TextColumn(disabled=True)
+            cfg["注音"] = st.column_config.TextColumn(disabled=True, width="small", pinned=True)
+            cfg["品項"] = st.column_config.TextColumn(disabled=True, pinned=True)
             for col, _ in BRAND_COLS:
                 cfg[col] = st.column_config.SelectboxColumn(options=options, width="small")
-            ed = st.data_editor(df, hide_index=True, use_container_width=True, height=_table_height(len(df)),
-                                column_config=cfg, key=f"cost_ed_{kind}_{section}")
+            ed = st.data_editor(_styled(df, css, band), hide_index=True, use_container_width=True,
+                                height=_table_height(len(df)), column_config=cfg, key=f"cost_ed_{kind}_{section}")
             if st.button("💾 儲存廠牌", type="primary", key=f"cost_save_{kind}_{section}"):
                 try:
                     n, synced = save_brand_edits(sec, df, ed, brands, clinic_id)
@@ -758,8 +808,8 @@ def _render_cost_table(kind, rows, brands_k, prices, high, brand_map, brands, cl
                 else:
                     st.info("沒有變更")
         else:
-            st.dataframe(df.style.apply(lambda _: css, axis=None), hide_index=True,
-                         use_container_width=True, height=_table_height(len(df)))
+            st.dataframe(_styled(df, css, band), hide_index=True, use_container_width=True,
+                         height=_table_height(len(df)), column_config=_view_cfg())
 
 
 def page_price():
@@ -834,20 +884,36 @@ def page_price():
     else:
         st.caption(f"📍 進價為全院共用（澤豐、澤沛同一份）。顯示 {scope}。")
 
+    s1, s2 = st.columns([3, 2])
+    with s1:
+        query = st.text_input("🔍 搜尋品項", key="price_search",
+                              placeholder="品名關鍵字，可多個（空格分隔，如「半夏 天麻」）" + ("；也可搜廠牌、櫃位" if is_cost else ""),
+                              help="同時過濾 複方／單方 兩個 tab，三區位置不變；只影響畫面，Excel 匯出仍是完整表格。"
+                                   "改搜尋字之前請先按儲存，未存的編輯會被清掉。")
+    with s2:
+        band_label = st.selectbox("列底色分組（方便左右對照）", list(BAND_OPTIONS), key="price_band",
+                                  help="每 5 列（或每列）交錯上底色，看橫列更不易串行。編輯模式下 Streamlit 只會替不可編輯的欄位上色。")
+    band = BAND_OPTIONS.get(band_label, 5)
+    terms = search_terms(query)
+    shown = {k: filter_rows(tables[k][0], terms, brand_map if is_cost else None) for k in KINDS}
+    if terms:
+        st.caption("🔍 符合「" + " ".join(terms) + "」：" + "、".join(f"{k} {len(shown[k])} 項" for k in KINDS)
+                   + "。清空搜尋框即恢復完整表格。")
+
     tabs = st.tabs(list(KINDS))
     for kind, tab in zip(KINDS, tabs):
         with tab:
-            rows, brands_k = tables[kind]
+            rows, brands_k = shown[kind], tables[kind][1]
             if not brands_k:
                 st.info(f"{kind} 尚未設定廠牌欄位，請至 系統設定 → 💰 進價表參數 新增。")
                 continue
             if not rows:
-                st.info("沒有啟用中的品項。")
+                st.info(f"{kind} 沒有符合「{' '.join(terms)}」的品項。" if terms else "沒有啟用中的品項。")
                 continue
             if is_cost:
-                _render_cost_table(kind, rows, brands_k, prices, high[kind], brand_map, brands, clinic_id)
+                _render_cost_table(kind, rows, brands_k, prices, high[kind], brand_map, brands, clinic_id, band)
             else:
-                _render_price_table(kind, rows, brands_k, prices, high[kind])
+                _render_price_table(kind, rows, brands_k, prices, high[kind], band)
 
 
 # ══════════════════════════════════════════════
